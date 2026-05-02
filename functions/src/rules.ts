@@ -1,9 +1,45 @@
 import { canonicalId, type ChannelEntry } from "./m3u.js";
 import { DEFAULT_RULES, LIMITS, type PlaylistRules } from "./constants.js";
 
+const STRING_LIST_KEYS: (keyof PlaylistRules)[] = [
+  "includeGroupPatterns",
+  "excludeGroupPatterns",
+  "includeNamePatterns",
+  "excludeNamePatterns",
+  "includeUrlPatterns",
+  "excludeUrlPatterns",
+  "allowNamePatterns",
+  "allowUrlPatterns",
+  "allowGroupPatterns",
+  "groupOrder",
+  "channelOrder",
+];
+
 export function mergePlaylistRules(raw: unknown): PlaylistRules {
   if (!raw || typeof raw !== "object") return { ...DEFAULT_RULES };
-  const merged = { ...DEFAULT_RULES, ...(raw as PlaylistRules) };
+  const merged: PlaylistRules = { ...DEFAULT_RULES, ...(raw as Partial<PlaylistRules>) };
+
+  for (const k of STRING_LIST_KEYS) {
+    const v = merged[k];
+    if (!Array.isArray(v)) (merged as Record<string, unknown>)[k as string] = [];
+    else (merged as Record<string, unknown>)[k as string] = v.filter((x): x is string => typeof x === "string");
+  }
+
+  const gr = merged.groupRenames;
+  if (!Array.isArray(gr)) merged.groupRenames = [];
+  else {
+    merged.groupRenames = gr.filter(
+      (x): x is { pattern: string; replacement: string } =>
+        Boolean(x) &&
+        typeof x === "object" &&
+        typeof (x as { pattern?: unknown }).pattern === "string" &&
+        typeof (x as { replacement?: unknown }).replacement === "string",
+    );
+  }
+
+  if (merged.dedupeBy !== "url" && merged.dedupeBy !== "name") merged.dedupeBy = "url";
+  if (typeof merged.dedupe !== "boolean") merged.dedupe = true;
+
   if (merged.channelOrder.length > LIMITS.MAX_CHANNEL_ORDER_ENTRIES) {
     merged.channelOrder = merged.channelOrder.slice(0, LIMITS.MAX_CHANNEL_ORDER_ENTRIES);
   }

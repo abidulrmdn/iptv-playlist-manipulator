@@ -57,7 +57,10 @@ function clientErrorMessage(e: unknown): string {
     if (code.startsWith("functions/")) {
       const c = code.replace(/^functions\//, "");
       if (/^internal$/i.test(c)) {
-        return "Server error — check the Functions emulator terminal (common fix: valid ENCRYPTION_KEY in functions/.env, then restart emulators).";
+        const onFnEmu = import.meta.env.DEV && import.meta.env.VITE_USE_EMULATOR === "true";
+        return onFnEmu
+          ? "Server error — check the Functions emulator terminal (common fix: valid ENCRYPTION_KEY in functions/.env, then restart emulators)."
+          : "Server error — open Firebase Console → Functions → Logs for details. If you deploy from CI, ensure ENCRYPTION_KEY is set on the Cloud Functions runtime (not only on your laptop).";
       }
       return c.replace(/-/g, " ");
     }

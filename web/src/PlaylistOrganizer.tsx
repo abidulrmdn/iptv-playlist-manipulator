@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { onAuthStateChanged, signOut, type User } from "firebase/auth";
 import { auth, callable, publicPlaylistUrl } from "./firebase";
 import { LIMITS } from "../../functions/src/constants";
+import { escapeRegExp } from "../../functions/src/excludeNamePatternChunks";
 import { applyRulesPreview, type PreviewChannel } from "./playlistRulesPreview";
 
 type EditorTab = "tv" | "movie" | "series";
@@ -35,10 +36,6 @@ type PlaylistRules = {
   latestGroupName: string;
   newMarkerPrefix: string;
 };
-
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
 
 function errMsg(e: unknown): string {
   if (e instanceof Error) {
@@ -276,6 +273,8 @@ export function PlaylistOrganizer() {
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
   const skipNextRulesAutosave = useRef(false);
   const rulesAutosaveToken = useRef(0);
+  /** Bumped before server-authoritative rule writes / reloads so debounced `updatePlaylist` cannot overwrite with stale rules. */
+  const rulesSaveGeneration = useRef(0);
   const [rulesAutosaveState, setRulesAutosaveState] = useState<"idle" | "saving" | "saved">("idle");
 
   const [playlistSidebarOpen, setPlaylistSidebarOpen] = useState(() => {
@@ -318,6 +317,7 @@ export function PlaylistOrganizer() {
       if (reset) loadedThroughRef.current = 0;
       setBusy(true);
       try {
+        rulesSaveGeneration.current += 1;
         const off = reset ? 0 : loadedThroughRef.current;
         const fn = callable<
           { playlistId: string; offset?: number; limit?: number },
@@ -399,33 +399,18 @@ export function PlaylistOrganizer() {
     });
   }, [tableSourceRows, tab, q]);
 
-  /** Counts for “exclude selected”: uses titles of loaded rows; selection can span the full server list. */
-  const excludeSelectedStats = useMemo(() => {
-    const selectedTotal = selected.size;
-    const loadedSelected = rows.filter((r) => selected.has(r.id));
-    const loadedCount = loadedSelected.length;
-    const withTitleCount = loadedSelected.filter((r) => r.title.trim()).length;
-    const missingFromTable = Math.max(0, selectedTotal - loadedCount);
-    const missingTitlesInLoaded = Math.max(0, loadedCount - withTitleCount);
-    return { selectedTotal, loadedCount, withTitleCount, missingFromTable, missingTitlesInLoaded };
-  }, [rows, selected]);
+  /** “Exclude selected” always runs on the server over the full generated M3U (not only loaded table rows). */
+  const excludeSelectedStats = useMemo(
+    () => ({ selectedTotal: selected.size, serverTotalChannels: total }),
+    [selected, total],
+  );
 
   const excludeSelectedButtonTitle = useMemo(() => {
     const s = excludeSelectedStats;
-    const parts: string[] = [
-      "Adds exclude rules from each selected channel’s title (exact match) for rows in this table.",
-    ];
-    if (s.missingFromTable > 0) {
-      parts.push(
-        `${s.missingFromTable.toLocaleString()} selected id(s) are not in the loaded table — load more to cover them.`,
-      );
+    if (s.selectedTotal === 0) {
+      return "Select channels, then add exact-title exclude rules from the full playlist file on the server.";
     }
-    if (s.missingTitlesInLoaded > 0) {
-      parts.push(
-        `${s.missingTitlesInLoaded.toLocaleString()} loaded selected row(s) have no title and will be skipped.`,
-      );
-    }
-    return parts.join(" ");
+    return `Runs on the server against the full generated playlist (${s.serverTotalChannels.toLocaleString()} channels) for your ${s.selectedTotal.toLocaleString()} selected channel id(s) — not limited to rows loaded in this table.`;
   }, [excludeSelectedStats]);
 
   /** Visible rows grouped by `group-title` (same order as rules `groupOrder`, then A–Z). */
@@ -589,6 +574,7 @@ export function PlaylistOrganizer() {
     if (!playlistId) return;
     setBusy(true);
     try {
+      rulesSaveGeneration.current += 1;
       const fn = callable<{ playlistId: string }, { ok: boolean; channelCount: number }>("refreshPlaylist", {
         timeout: 600_000,
       });
@@ -608,23 +594,29 @@ export function PlaylistOrganizer() {
       skipNextRulesAutosave.current = false;
       return;
     }
+    const scheduledGen = rulesSaveGeneration.current;
     const t = window.setTimeout(() => {
+      if (rulesSaveGeneration.current !== scheduledGen) return;
       const token = ++rulesAutosaveToken.current;
       void (async () => {
         setRulesAutosaveState("saving");
         try {
+          if (rulesSaveGeneration.current !== scheduledGen) {
+            setRulesAutosaveState("idle");
+            return;
+          }
           const u = callable<
             { id: string; rules: PlaylistRules; enrichEnabled: boolean; duplicateNewIntoLatest: boolean },
             { ok: boolean }
           >("updatePlaylist");
           await u({ id: playlistId, rules, enrichEnabled, duplicateNewIntoLatest: dupLatest });
-          if (token !== rulesAutosaveToken.current) return;
+          if (token !== rulesAutosaveToken.current || rulesSaveGeneration.current !== scheduledGen) return;
           setRulesAutosaveState("saved");
           window.setTimeout(() => {
             setRulesAutosaveState((s) => (s === "saved" ? "idle" : s));
           }, 1800);
         } catch (e) {
-          if (token === rulesAutosaveToken.current) {
+          if (token === rulesAutosaveToken.current && rulesSaveGeneration.current === scheduledGen) {
             setRulesAutosaveState("idle");
             notify(errMsg(e));
           }
@@ -700,54 +692,62 @@ export function PlaylistOrganizer() {
     notify(`Added ${mode} pattern on ${field}.`);
   };
 
-  const excludeSelectedByName = () => {
-    if (!rules) return;
-    const pick = rows.filter((r) => selected.has(r.id));
-    if (pick.length === 0) {
-      notify(
-        selected.size > 0
-          ? "No selected rows are loaded — use “Load more” or a smaller selection so titles are available."
-          : "Select at least one row.",
-      );
+  const excludeSelectedByName = async () => {
+    if (!rules || !playlistId) return;
+    if (selected.size === 0) {
+      notify("Select at least one row.");
       return;
     }
-    const titles = pick.map((r) => r.title.trim()).filter(Boolean);
-    if (titles.length === 0) {
-      notify("Selected channels have no titles to match on.");
-      return;
-    }
-    /** Keep each alternation regex small enough for the JS engine (chunk if many titles). */
-    const chunkSize = 80;
-    const newPatterns: string[] = [];
-    for (let i = 0; i < titles.length; i += chunkSize) {
-      const chunk = [...new Set(titles.slice(i, i + chunkSize))];
-      if (chunk.length === 0) continue;
-      const inner = chunk.map((t) => escapeRegExp(t)).join("|");
-      const pattern = `^(?:${inner})$`;
-      try {
-        void new RegExp(pattern);
-      } catch {
-        notify("Could not build name patterns for this selection (try a smaller selection or shorter titles).");
+
+    rulesSaveGeneration.current += 1;
+    setBusy(true);
+    try {
+      const fn = callable<
+        { playlistId: string; channelIds: string[] },
+        {
+          ok: boolean;
+          rules: PlaylistRules;
+          addedChunks: number;
+          totalChunks: number;
+          channelRowsMatched: number;
+          uniqueTitles: number;
+          idsRequested: number;
+          idsFoundInFile: number;
+          idsMissingFromFile: number;
+        }
+      >("bulkExcludeByNamesForChannelIds", { timeout: 120_000 });
+      const r = await fn({ playlistId, channelIds: [...selected] });
+      const d = r.data;
+      if (!d?.rules) {
+        notify(
+          "Exclude failed — empty response from the server. Deploy the latest Cloud Functions (including bulkExcludeByNamesForChannelIds).",
+        );
         return;
       }
-      newPatterns.push(pattern);
-    }
-    const arr = [...rules.excludeNamePatterns];
-    let added = 0;
-    for (const p of newPatterns) {
-      if (!arr.includes(p)) {
-        arr.push(p);
-        added++;
+      skipNextRulesAutosave.current = true;
+      setRules(d.rules);
+      const parts: string[] = [];
+      if (d.addedChunks > 0) {
+        parts.push(
+          `Added ${d.addedChunks.toLocaleString()} new name-exclude chunk(s) for ${d.channelRowsMatched.toLocaleString()} channel title row(s) (${d.uniqueTitles.toLocaleString()} unique titles) from ${d.idsFoundInFile.toLocaleString()} of ${d.idsRequested.toLocaleString()} selected id(s) in the playlist file.`,
+        );
+      } else {
+        parts.push(
+          `No new exclude chunks added — patterns for those ${d.channelRowsMatched.toLocaleString()} title row(s) (${d.uniqueTitles.toLocaleString()} unique) were already saved.`,
+        );
       }
+      if (d.idsMissingFromFile > 0) {
+        parts.push(
+          `${d.idsMissingFromFile.toLocaleString()} selected id(s) were not in the file (stale selection or rebuild changed ids).`,
+        );
+      }
+      notify(parts.join(" "));
+      clearSel();
+    } catch (e) {
+      notify(errMsg(e));
+    } finally {
+      setBusy(false);
     }
-    setRules({ ...rules, excludeNamePatterns: arr });
-    clearSel();
-    const skipped = selected.size - pick.length;
-    const extra =
-      skipped > 0
-        ? ` (${skipped.toLocaleString()} selected id(s) not in loaded rows — load more to include them.)`
-        : "";
-    notify(`Added ${added} exclude-by-name pattern(s) for ${titles.length.toLocaleString()} title(s).${extra}`);
   };
 
   /** Add allow-* regex chunks so selected rows pass the rules again after save + rebuild. */
@@ -1083,18 +1083,18 @@ export function PlaylistOrganizer() {
                   <button
                     type="button"
                     disabled={busy || !rules || selected.size === 0}
-                    onClick={excludeSelectedByName}
+                    onClick={() => void excludeSelectedByName()}
                     title={excludeSelectedButtonTitle}
                     className={orgBtnAmber}
                   >
                     {excludeSelectedStats.selectedTotal === 0 ? (
                       "Exclude selected"
-                    ) : excludeSelectedStats.withTitleCount === excludeSelectedStats.selectedTotal ? (
-                      <>Exclude selected ({excludeSelectedStats.withTitleCount.toLocaleString()})</>
+                    ) : excludeSelectedStats.selectedTotal === excludeSelectedStats.serverTotalChannels ? (
+                      <>Exclude selected ({excludeSelectedStats.selectedTotal.toLocaleString()}) — full playlist</>
                     ) : (
                       <>
-                        Exclude selected ({excludeSelectedStats.withTitleCount.toLocaleString()} of{" "}
-                        {excludeSelectedStats.selectedTotal.toLocaleString()})
+                        Exclude selected ({excludeSelectedStats.selectedTotal.toLocaleString()} of{" "}
+                        {excludeSelectedStats.serverTotalChannels.toLocaleString()})
                       </>
                     )}
                   </button>

@@ -5,6 +5,7 @@ dist
 .env
 .env.local
 functions/.env
+functions/.secret.local
 web/.env
 functions/lib
 web/dist

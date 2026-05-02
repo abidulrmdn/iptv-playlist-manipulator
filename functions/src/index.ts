@@ -5,12 +5,14 @@ import { randomBytes } from "crypto";
 import { initializeApp } from "firebase-admin/app";
 import { FieldValue, getFirestore, Timestamp } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
+import { defineSecret } from "firebase-functions/params";
 import { HttpsError, onCall, onRequest } from "firebase-functions/v2/https";
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import { setGlobalOptions } from "firebase-functions/v2/options";
 import { encryptUtf8 } from "./crypto.js";
 import { DEFAULT_RULES, LIMITS } from "./constants.js";
 import { classifyEditorTab } from "./editorTab.js";
+import { buildExcludeNamePatternsFromTitles } from "./excludeNamePatternChunks.js";
 import { canonicalId, parseM3u } from "./m3u.js";
 import { mergePlaylistRules } from "./rules.js";
 import { runPlaylistRefresh } from "./refresh.js";
@@ -24,6 +26,13 @@ const db = getFirestore();
 const bucket = getStorage().bucket();
 
 setGlobalOptions({ region: "us-central1", maxInstances: 5 });
+
+/**
+ * Secret Manager id (must not match `ENCRYPTION_KEY` in functions/.env — Firebase would reject
+ * overlapping plain env + secret on the same Cloud Run revision).
+ * Runtime value is read in `crypto.ts` via `process.env.IPTV_ENCRYPTION_KEY`.
+ */
+const encryptionKeySecret = defineSecret("IPTV_ENCRYPTION_KEY");
 
 function requireAuth(uid: string | undefined): asserts uid is string {
   if (!uid) throw new HttpsError("unauthenticated", "Sign in required");
@@ -48,7 +57,7 @@ async function countUserPlaylists(uid: string): Promise<number> {
   return snap.size;
 }
 
-export const upsertSource = onCall(async (request) => {
+export const upsertSource = onCall({ secrets: [encryptionKeySecret] }, async (request) => {
   requireAuth(request.auth?.uid);
   const uid = request.auth!.uid;
   const label = String(request.data?.label ?? "").slice(0, LIMITS.MAX_LABEL_LENGTH);
@@ -70,39 +79,56 @@ export const upsertSource = onCall(async (request) => {
     urlEnc = encryptUtf8(url);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes("ENCRYPTION_KEY")) {
+    const inEmu = process.env.FUNCTIONS_EMULATOR === "true";
+    if (msg.includes("ENCRYPTION_KEY") || msg.includes("IPTV_ENCRYPTION_KEY")) {
       throw new HttpsError(
         "failed-precondition",
-        "ENCRYPTION_KEY is missing or not 32 bytes after base64 decode. Set it in functions/.env (run: openssl rand -base64 32). Restart emulators after changing it.",
+        inEmu
+          ? "Encryption key is missing or invalid. Set ENCRYPTION_KEY in functions/.env (openssl rand -base64 32), then restart the emulators."
+          : "Server encryption is not configured: set Secret IPTV_ENCRYPTION_KEY (same value as ENCRYPTION_KEY in docs) with firebase functions:secrets:set, then redeploy.",
       );
     }
     console.error("upsertSource encrypt error", err);
-    throw new HttpsError("internal", "Could not encrypt source URL");
+    throw new HttpsError(
+      "failed-precondition",
+      inEmu
+        ? "Could not encrypt the source URL. Check the Functions emulator logs and ENCRYPTION_KEY in functions/.env."
+        : "Could not encrypt the source URL. Check Cloud Functions logs and ENCRYPTION_KEY on the deployed service.",
+    );
   }
 
   const id = String(request.data?.id ?? "");
-  if (id) {
-    const ref = db.collection("sources").doc(id);
-    const snap = await ref.get();
-    if (!snap.exists || (snap.data() as { ownerUid?: string }).ownerUid !== uid) {
-      throw new HttpsError("not-found", "Source not found");
+  try {
+    if (id) {
+      const ref = db.collection("sources").doc(id);
+      const snap = await ref.get();
+      if (!snap.exists || (snap.data() as { ownerUid?: string }).ownerUid !== uid) {
+        throw new HttpsError("not-found", "Source not found");
+      }
+      await ref.update({
+        label,
+        urlEnc,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      return { id };
     }
-    await ref.update({
-      label,
-      urlEnc,
-      updatedAt: FieldValue.serverTimestamp(),
-    });
-    return { id };
-  }
 
-  const ref = db.collection("sources").doc();
-  await ref.set({
-    ownerUid: uid,
-    label: label || "Source",
-    urlEnc,
-    createdAt: FieldValue.serverTimestamp(),
-  });
-  return { id: ref.id };
+    const ref = db.collection("sources").doc();
+    await ref.set({
+      ownerUid: uid,
+      label: label || "Source",
+      urlEnc,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    return { id: ref.id };
+  } catch (e) {
+    if (e instanceof HttpsError) throw e;
+    console.error("upsertSource Firestore error", e);
+    throw new HttpsError(
+      "failed-precondition",
+      "Could not save the source. Check Functions logs and Firestore status.",
+    );
+  }
 });
 
 export const deleteSource = onCall(async (request) => {
@@ -170,7 +196,7 @@ export const updatePlaylist = onCall(async (request) => {
 
   const patch: Record<string, unknown> = { updatedAt: FieldValue.serverTimestamp() };
   if (request.data?.name != null) patch.name = String(request.data.name).slice(0, LIMITS.MAX_PLAYLIST_NAME_LENGTH);
-  if (request.data?.rules != null) patch.rules = { ...DEFAULT_RULES, ...request.data.rules };
+  if (request.data?.rules != null) patch.rules = mergePlaylistRules(request.data.rules);
   if (request.data?.sourceIds != null) {
     const sourceIds = request.data.sourceIds as string[];
     if (!Array.isArray(sourceIds) || sourceIds.length > LIMITS.MAX_SOURCES_PER_USER) {
@@ -193,7 +219,9 @@ export const updatePlaylist = onCall(async (request) => {
   return { ok: true };
 });
 
-export const refreshPlaylist = onCall({ memory: "1GiB", timeoutSeconds: 540 }, async (request) => {
+export const refreshPlaylist = onCall(
+  { memory: "1GiB", timeoutSeconds: 540, secrets: [encryptionKeySecret] },
+  async (request) => {
     requireAuth(request.auth?.uid);
     const uid = request.auth!.uid;
     const playlistId = String(request.data?.playlistId ?? "");
@@ -219,7 +247,8 @@ export const refreshPlaylist = onCall({ memory: "1GiB", timeoutSeconds: 540 }, a
       // Use failed-precondition so the client surfaces `message` instead of a generic internal code.
       throw new HttpsError("failed-precondition", msg);
     }
-});
+  },
+);
 
 export const getDiffSummary = onCall(async (request) => {
   requireAuth(request.auth?.uid);
@@ -339,6 +368,115 @@ export const getPlaylistEditorChannelIds = onCall({ memory: "512MiB", timeoutSec
   return { total: ids.length, ids };
 });
 
+/**
+ * Adds exclude-by-exact-name patterns for every selected channel id by reading the full generated M3U
+ * (same source as “Entire playlist” selection). Use when the selection includes ids not loaded in the editor table.
+ */
+export const bulkExcludeByNamesForChannelIds = onCall({ memory: "512MiB", timeoutSeconds: 120 }, async (request) => {
+  requireAuth(request.auth?.uid);
+  const uid = request.auth!.uid;
+  const playlistId = String(request.data?.playlistId ?? "");
+  const rawIds = (request.data as { channelIds?: unknown })?.channelIds;
+  if (!playlistId) throw new HttpsError("invalid-argument", "Missing playlistId");
+  if (!Array.isArray(rawIds) || rawIds.length === 0) {
+    throw new HttpsError("invalid-argument", "channelIds must be a non-empty array");
+  }
+  const channelIds = [...new Set(rawIds.map((x) => String(x ?? "").trim()).filter(Boolean))];
+  if (channelIds.length > LIMITS.MAX_CHANNELS_PER_PLAYLIST) {
+    throw new HttpsError("invalid-argument", "Too many channel ids");
+  }
+  const idSet = new Set(channelIds);
+
+  const ref = db.collection("playlists").doc(playlistId);
+  const snap = await ref.get();
+  if (!snap.exists || (snap.data() as { ownerUid?: string }).ownerUid !== uid) {
+    throw new HttpsError("not-found", "Playlist not found");
+  }
+
+  const objectPath = `users/${uid}/playlists/${playlistId}/playlist.m3u`;
+  const file = bucket.file(objectPath);
+  const [exists] = await file.exists();
+  if (!exists) {
+    throw new HttpsError(
+      "failed-precondition",
+      "No generated playlist file yet. On the main app, run “Rebuild M3U for player” once first.",
+    );
+  }
+
+  const [buf] = await file.download();
+  const text = buf.toString("utf8");
+  if (Buffer.byteLength(text, "utf8") > LIMITS.MAX_M3U_BYTES) {
+    throw new HttpsError("resource-exhausted", "Playlist file is too large");
+  }
+
+  const all = parseM3u(text);
+  const foundIds = new Set<string>();
+  const titles: string[] = [];
+  for (const ch of all) {
+    const id = canonicalId(ch);
+    if (!idSet.has(id)) continue;
+    foundIds.add(id);
+    const t = ch.title.trim();
+    if (t) titles.push(t);
+  }
+
+  const idsMissingFromFile = channelIds.filter((id) => !foundIds.has(id)).length;
+
+  if (titles.length === 0) {
+    throw new HttpsError(
+      "failed-precondition",
+      idsMissingFromFile === channelIds.length
+        ? "None of the selected channel ids appear in the current playlist file (rebuild and try again)."
+        : "Selected channels have no titles to match on in the playlist file.",
+    );
+  }
+
+  let newPatterns: string[];
+  try {
+    newPatterns = buildExcludeNamePatternsFromTitles(titles);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new HttpsError("failed-precondition", msg);
+  }
+
+  const data = snap.data() as { rules?: unknown };
+  const rules = mergePlaylistRules(data.rules);
+  const arr = [...rules.excludeNamePatterns];
+  let added = 0;
+  for (const p of newPatterns) {
+    if (!arr.includes(p)) {
+      arr.push(p);
+      added++;
+    }
+  }
+  const nextRules = { ...rules, excludeNamePatterns: arr };
+  try {
+    await ref.update({ rules: nextRules, updatedAt: FieldValue.serverTimestamp() });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/1048576|longer than|maximum|limit|exceeds|too large|size/i.test(msg)) {
+      throw new HttpsError(
+        "resource-exhausted",
+        "Playlist rules are too large to save (Firestore limit). Remove some older exclude patterns or run exclude on fewer channels at a time.",
+      );
+    }
+    console.error("bulkExcludeByNamesForChannelIds update", e);
+    throw new HttpsError("internal", msg || "Could not save playlist rules");
+  }
+
+  return {
+    ok: true,
+    rules: nextRules,
+    addedChunks: added,
+    totalChunks: newPatterns.length,
+    channelRowsMatched: titles.length,
+    uniqueTitles: new Set(titles).size,
+    idsRequested: channelIds.length,
+    idsFoundInFile: foundIds.size,
+    idsMissingFromFile,
+  };
+});
+
 /** Public M3U for IPTV players (no auth). Use `?token=<publicToken>` or path ending in token.m3u */
 export const publicPlaylist = onRequest({ cors: false, memory: "512MiB" }, async (req, res) => {
   const url = new URL(req.url, "http://localhost");
@@ -390,7 +528,13 @@ export const publicPlaylist = onRequest({ cors: false, memory: "512MiB" }, async
 
 /** Weekly refresh window (MVP plan): Mondays 09:00 UTC; cost-capped batch (15 playlists max per run). */
 export const scheduledPlaylistRefresh = onSchedule(
-  { schedule: "0 9 * * 1", timeZone: "Etc/UTC", memory: "1GiB", timeoutSeconds: 540 },
+  {
+    schedule: "0 9 * * 1",
+    timeZone: "Etc/UTC",
+    memory: "1GiB",
+    timeoutSeconds: 540,
+    secrets: [encryptionKeySecret],
+  },
   async () => {
     const snap = await db
       .collection("playlists")
