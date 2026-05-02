@@ -1,0 +1,21 @@
+{
+  "name": "iptv-list-manager",
+  "private": true,
+  "workspaces": ["functions", "web"],
+  "scripts": {
+    "build": "npm run build -w functions && npm run build -w web",
+    "dev:web": "npm run dev -w web",
+    "serve": "firebase emulators:start",
+    "emulators": "firebase emulators:start",
+    "up": "concurrently -k -n emulators,web -c blue,green \"npm run emulators\" \"wait-on http://127.0.0.1:4000 && npm run dev -w web\"",
+    "lint": "npm run lint -w web --if-present && npm run lint -w functions --if-present"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "wait-on": "^8.0.1",
+    "firebase-tools": "^13.29.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
