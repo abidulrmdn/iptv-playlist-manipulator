@@ -5,7 +5,10 @@ dist
 .env
 .env.local
 functions/.env
+web/.env
 functions/lib
 web/dist
 .emulator-data
 .DS_Store
+*-debug.log
+serviceAccount*.json

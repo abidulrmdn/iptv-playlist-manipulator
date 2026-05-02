@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   User,
-  createUserWithEmailAndPassword,
+  isSignInWithEmailLink,
   onAuthStateChanged,
-  signInWithEmailAndPassword,
+  sendSignInLinkToEmail,
+  signInWithEmailLink,
   signOut,
 } from "firebase/auth";
 import { collection, onSnapshot, orderBy, query, where } from "firebase/firestore";
-import { auth, callable, db, publicPlaylistUrl } from "./firebase";
+import { auth, callable, db, getEmailLinkContinueUrl, publicPlaylistUrl } from "./firebase";
+
+const EMAIL_LINK_STORAGE_KEY = "emailForSignIn";
 
 type SourceRow = { id: string; label: string; createdAt?: { seconds?: number } };
 type PlaylistRow = {
@@ -46,9 +49,10 @@ const defaultRulesJson = JSON.stringify(
 export function App() {
   const [user, setUser] = useState<User | null>(null);
   const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [linkSent, setLinkSent] = useState(false);
+  const [completingLink, setCompletingLink] = useState(false);
 
   const [sources, setSources] = useState<SourceRow[]>([]);
   const [playlists, setPlaylists] = useState<PlaylistRow[]>([]);
@@ -69,6 +73,40 @@ export function App() {
 
   useEffect(() => {
     return onAuthStateChanged(auth, setUser);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!isSignInWithEmailLink(auth, window.location.href)) return;
+
+    let cancelled = false;
+    setCompletingLink(true);
+    (async () => {
+      try {
+        let mail = localStorage.getItem(EMAIL_LINK_STORAGE_KEY);
+        if (!mail) {
+          mail = window.prompt("Enter the same email address to complete sign-in")?.trim() ?? "";
+        }
+        if (!mail) throw new Error("Email is required to complete sign-in");
+        await signInWithEmailLink(auth, mail, window.location.href);
+        if (cancelled) return;
+        localStorage.removeItem(EMAIL_LINK_STORAGE_KEY);
+        window.history.replaceState({}, document.title, window.location.pathname);
+        setToast("Signed in");
+        setTimeout(() => setToast(null), 4200);
+      } catch (e) {
+        if (!cancelled) {
+          setToast(e instanceof Error ? e.message : "Could not complete sign-in");
+          setTimeout(() => setToast(null), 5200);
+        }
+      } finally {
+        if (!cancelled) setCompletingLink(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -124,16 +162,16 @@ export function App() {
     }
   };
 
-  const register = () =>
+  const sendEmailLink = () =>
     run(async () => {
-      await createUserWithEmailAndPassword(auth, email.trim(), password);
-      notify("Account ready");
-    });
-
-  const login = () =>
-    run(async () => {
-      await signInWithEmailAndPassword(auth, email.trim(), password);
-      notify("Signed in");
+      const mail = email.trim();
+      if (!mail) throw new Error("Enter your email");
+      const url = getEmailLinkContinueUrl();
+      if (!url) throw new Error("Could not build sign-in link URL");
+      await sendSignInLinkToEmail(auth, mail, { url, handleCodeInApp: true });
+      localStorage.setItem(EMAIL_LINK_STORAGE_KEY, mail);
+      setLinkSent(true);
+      notify("Check your email for the sign-in link");
     });
 
   const logout = () => signOut(auth);
@@ -211,40 +249,42 @@ export function App() {
       <div className="min-h-screen flex items-center justify-center p-6 bg-gradient-to-b from-zinc-950 via-zinc-900 to-zinc-950">
         <div className="w-full max-w-md rounded-2xl border border-zinc-800 bg-zinc-900/60 p-8 shadow-2xl backdrop-blur">
           <h1 className="font-display text-3xl font-semibold tracking-tight text-white">IPTV List Manager</h1>
-          <p className="mt-2 text-sm text-zinc-400">Sign in to add M3U sources, merge, filter, and get a stable player URL.</p>
-          <label className="mt-6 block text-xs font-medium uppercase tracking-wide text-zinc-500">Email</label>
-          <input
-            className="mt-1 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm outline-none ring-emerald-500/40 focus:ring-2"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            autoComplete="email"
-          />
-          <label className="mt-4 block text-xs font-medium uppercase tracking-wide text-zinc-500">Password</label>
-          <input
-            type="password"
-            className="mt-1 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm outline-none ring-emerald-500/40 focus:ring-2"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            autoComplete="current-password"
-          />
-          <div className="mt-6 flex gap-3">
-            <button
-              type="button"
-              disabled={busy}
-              onClick={login}
-              className="flex-1 rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-50"
-            >
-              Sign in
-            </button>
-            <button
-              type="button"
-              disabled={busy}
-              onClick={register}
-              className="flex-1 rounded-lg border border-zinc-600 px-4 py-2.5 text-sm font-semibold text-zinc-100 hover:bg-zinc-800 disabled:opacity-50"
-            >
-              Register
-            </button>
-          </div>
+          <p className="mt-2 text-sm text-zinc-400">
+            Passwordless sign-in: we email you a link. New users are created automatically the first time they sign in.
+          </p>
+          {completingLink ? (
+            <p className="mt-8 text-center text-sm text-zinc-300">Completing sign-in…</p>
+          ) : (
+            <>
+              <label className="mt-6 block text-xs font-medium uppercase tracking-wide text-zinc-500">Email</label>
+              <input
+                className="mt-1 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm outline-none ring-emerald-500/40 focus:ring-2"
+                value={email}
+                onChange={(e) => {
+                  setEmail(e.target.value);
+                  setLinkSent(false);
+                }}
+                autoComplete="email"
+                type="email"
+                inputMode="email"
+                placeholder="you@example.com"
+              />
+              <button
+                type="button"
+                disabled={busy || !email.trim()}
+                onClick={sendEmailLink}
+                className="mt-6 w-full rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-50"
+              >
+                Email me a sign-in link
+              </button>
+              {linkSent && (
+                <p className="mt-4 text-sm text-zinc-400">
+                  Link sent. Open it on this device for the smoothest flow, or use the same email in the prompt if you open
+                  the link elsewhere.
+                </p>
+              )}
+            </>
+          )}
           {toast && <p className="mt-4 text-sm text-amber-300">{toast}</p>}
         </div>
       </div>

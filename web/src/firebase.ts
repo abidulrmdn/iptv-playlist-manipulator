@@ -28,6 +28,14 @@ export function callable<TReq, TRes>(name: string) {
   return httpsCallable<TReq, TRes>(functions, name);
 }
 
+/** Full URL Firebase may redirect to after the user clicks the email link (`handleCodeInApp: true`). */
+export function getEmailLinkContinueUrl(): string {
+  const explicit = import.meta.env.VITE_EMAIL_LINK_CONTINUE_URL?.trim();
+  if (explicit) return explicit;
+  if (typeof window === "undefined") return "";
+  return new URL(import.meta.env.BASE_URL || "/", window.location.origin).href;
+}
+
 export function publicPlaylistUrl(publicToken: string): string {
   const pid = import.meta.env.VITE_FIREBASE_PROJECT_ID;
   if (import.meta.env.DEV && import.meta.env.VITE_USE_EMULATOR === "true") {

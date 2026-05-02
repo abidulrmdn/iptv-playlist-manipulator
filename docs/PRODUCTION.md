@@ -21,7 +21,7 @@ In the same Firebase project:
 
 | Product | Where | Action |
 |--------|--------|--------|
-| **Authentication** | Build → Authentication → Sign-in method | Enable **Email/Password**. |
+| **Authentication** | Build → Authentication → Sign-in method | Enable **Email/Password** and turn on **Email link (passwordless sign-in)** in the same provider. |
 | **Firestore** | Build → Firestore Database | **Create database** → production region you prefer (e.g. `nam5` / `us-central`). |
 | **Storage** | Build → Storage | **Get started** → default bucket is fine. |
 | **Functions** | Build → Functions | Complete any first-time setup wizard. |

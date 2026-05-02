@@ -8,7 +8,7 @@ A **Firebase** app that sits between IPTV providers and players: you add one or 
 
 | Milestone | Features |
 |-----------|----------|
-| **A** | Email/password auth, **encrypted** sources, playlists with **ordered** sources, **rules JSON** (filters, dedupe, group renames, group order), **manual refresh**, output written to **Cloud Storage**, **public** HTTPS endpoint `publicPlaylist`, **daily** scheduled refresh (cost-capped batch), hard **limits** in `functions/src/constants.ts`. |
+| **A** | Passwordless **email link** auth, **encrypted** sources, playlists with **ordered** sources, **rules JSON** (filters, dedupe, group renames, group order), **manual refresh**, output written to **Cloud Storage**, **public** HTTPS endpoint `publicPlaylist`, **daily** scheduled refresh (cost-capped batch), hard **limits** in `functions/src/constants.ts`. |
 | **B** | Optional **TMDB** enrichment (playlist toggle + `TMDB_API_KEY` on Functions), TMDB attribution line in the M3U. |
 | **C** | **Snapshot** `canonical-ids.json`, **`diff-summary.json`**, after the first snapshot **new** streams get a **`[NEW]`** prefix on `group-title`, optional **duplicate** row into **“Latest fetch”** (same stream URL). |
 
@@ -42,7 +42,9 @@ A **Firebase** app that sits between IPTV providers and players: you add one or 
 make up
 ```
 
-Same without Make: **`npm run up`** — starts **Firebase emulators** and **Vite** together (Ctrl+C stops both). Vite waits until the **Emulator UI** is up at **http://127.0.0.1:4000** so the stack is ready in one process group.
+`make up` runs **`free-ports`** first (uses **`lsof`** + **`kill`** to clear listeners on the emulator/Vite ports from `Makefile`, then starts the stack). Same without Make: **`npm run up`** (does not free ports).
+
+Starts **Firebase emulators** and **Vite** together (Ctrl+C stops both). Vite waits until the **Emulator UI** is up at **http://127.0.0.1:4000** so the stack is ready in one process group.
 
 ### First time only
 
@@ -68,7 +70,7 @@ Unset **`GOOGLE_APPLICATION_CREDENTIALS`** if the Functions emulator warns about
 
 **Detailed checklist (IAM, budgets, troubleshooting):** **[docs/PRODUCTION.md](docs/PRODUCTION.md)**.
 
-1. In [Firebase Console](https://console.firebase.google.com/): **Blaze** billing, **budget alerts**; enable **Authentication** (email/password), **Firestore**, **Storage**, **Functions**.
+1. In [Firebase Console](https://console.firebase.google.com/): **Blaze** billing, **budget alerts**; enable **Authentication** (Email/Password provider with **Email link**), **Firestore**, **Storage**, **Functions**. Add your **Hosting / continue URL** domain under Auth → **Authorized domains** if needed.
 2. **`web/.env`** — Web app config from Project settings, **`VITE_USE_EMULATOR=false`**, then `npm run build -w web`.
 3. **`functions/.env`** — `ENCRYPTION_KEY` (required); optional `TMDB_API_KEY`. The CLI loads this when you run `firebase deploy` from this machine ([env docs](https://firebase.google.com/docs/functions/config-env)).
 4. **`firebase login`** and **`firebase use <project-id>`** (see `.firebaserc`).
