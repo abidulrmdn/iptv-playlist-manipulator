@@ -1,14 +1,20 @@
-import { canonicalId, type ChannelEntry } from "./m3u.js";
-import { DEFAULT_RULES, LIMITS, type PlaylistRules } from "./constants.js";
+/**
+ * Client-side preview of `functions/src/rules.ts` → `applyRules` (keep in sync when server rules change).
+ * Used only to hide/show rows in the organizer; the rebuilt M3U still comes from the server.
+ */
+import type { PlaylistRules } from "../../functions/src/constants";
 
-export function mergePlaylistRules(raw: unknown): PlaylistRules {
-  if (!raw || typeof raw !== "object") return { ...DEFAULT_RULES };
-  const merged = { ...DEFAULT_RULES, ...(raw as PlaylistRules) };
-  if (merged.channelOrder.length > LIMITS.MAX_CHANNEL_ORDER_ENTRIES) {
-    merged.channelOrder = merged.channelOrder.slice(0, LIMITS.MAX_CHANNEL_ORDER_ENTRIES);
-  }
-  return merged;
-}
+export type PreviewChannel = {
+  duration: string;
+  title: string;
+  url: string;
+  attrString: string;
+  groupTitle?: string;
+  tvgLogo?: string;
+  tvgName?: string;
+  /** Server channel id (canonical); used with `rules.channelOrder` in the organizer preview. */
+  editorId?: string;
+};
 
 function compileSafe(pattern: string): RegExp | null {
   try {
@@ -35,11 +41,11 @@ function applyGroupRenames(rules: PlaylistRules, group: string | undefined): str
   return g;
 }
 
-function sortChannelsByRules(out: ChannelEntry[], rules: PlaylistRules): void {
+function sortPreviewByRules<T extends PreviewChannel>(out: T[], rules: PlaylistRules): void {
   const groupRank = new Map<string, number>();
   rules.groupOrder.forEach((g, idx) => groupRank.set(g, idx));
   const chanRank = new Map<string, number>();
-  rules.channelOrder.forEach((id, idx) => chanRank.set(id, idx));
+  (rules.channelOrder ?? []).forEach((id, idx) => chanRank.set(id, idx));
   out.sort((a, b) => {
     const ga = a.groupTitle ?? "";
     const gb = b.groupTitle ?? "";
@@ -48,16 +54,16 @@ function sortChannelsByRules(out: ChannelEntry[], rules: PlaylistRules): void {
     if (ra !== rb) return ra - rb;
     const gcmp = ga.localeCompare(gb);
     if (gcmp !== 0) return gcmp;
-    const ida = canonicalId(a);
-    const idb = canonicalId(b);
-    const oa = chanRank.has(ida) ? chanRank.get(ida)! : 1_000_000;
-    const ob = chanRank.has(idb) ? chanRank.get(idb)! : 1_000_000;
+    const ida = (a as PreviewChannel).editorId;
+    const idb = (b as PreviewChannel).editorId;
+    const oa = ida && chanRank.has(ida) ? chanRank.get(ida)! : 1_000_000;
+    const ob = idb && chanRank.has(idb) ? chanRank.get(idb)! : 1_000_000;
     if (oa !== ob) return oa - ob;
     return a.title.localeCompare(b.title);
   });
 }
 
-export function applyRules(entries: ChannelEntry[], rules: PlaylistRules): ChannelEntry[] {
+export function applyRulesPreview<T extends PreviewChannel>(entries: T[], rules: PlaylistRules): T[] {
   let out = entries.map((e) => ({ ...e }));
 
   for (let i = 0; i < out.length; i++) {
@@ -91,13 +97,13 @@ export function applyRules(entries: ChannelEntry[], rules: PlaylistRules): Chann
     });
   }
 
-  sortChannelsByRules(out, rules);
+  sortPreviewByRules(out, rules);
 
   const allowN = rules.allowNamePatterns;
   const allowU = rules.allowUrlPatterns;
   const allowG = rules.allowGroupPatterns;
   if (allowN.length > 0 || allowU.length > 0 || allowG.length > 0) {
-    const keyFn = (ch: ChannelEntry) =>
+    const keyFn = (ch: T) =>
       rules.dedupeBy === "name" ? ch.title.trim().toLowerCase() : ch.url.trim();
     const inOut = new Set(out.map(keyFn));
     const rescued = afterRename.filter((ch) => {
@@ -118,7 +124,7 @@ export function applyRules(entries: ChannelEntry[], rules: PlaylistRules): Chann
           return true;
         });
       }
-      sortChannelsByRules(out, rules);
+      sortPreviewByRules(out, rules);
     }
   }
 

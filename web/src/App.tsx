@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   User,
@@ -81,6 +81,15 @@ type PlaylistRow = {
   lastSuccessAt?: { seconds?: number };
 };
 
+/** Written by the server after each successful rebuild; used for “what changed” in the UI. */
+type DiffSummary = {
+  previousCount: number;
+  currentCount: number;
+  newCount: number;
+  removedApprox: number;
+  updatedAt: string;
+};
+
 const defaultRulesJson = JSON.stringify(
   {
     dedupe: true,
@@ -91,8 +100,12 @@ const defaultRulesJson = JSON.stringify(
     excludeNamePatterns: [] as string[],
     includeUrlPatterns: [] as string[],
     excludeUrlPatterns: [] as string[],
+    allowNamePatterns: [] as string[],
+    allowUrlPatterns: [] as string[],
+    allowGroupPatterns: [] as string[],
     groupRenames: [] as { pattern: string; replacement: string }[],
     groupOrder: [] as string[],
+    channelOrder: [] as string[],
     latestGroupName: "Latest fetch",
     newMarkerPrefix: "[NEW] ",
   },
@@ -124,7 +137,16 @@ export function App() {
   const [rulesJson, setRulesJson] = useState(defaultRulesJson);
   const [enrich, setEnrich] = useState(false);
   const [dupLatest, setDupLatest] = useState(true);
-  const [diffText, setDiffText] = useState<string | null>(null);
+  /** `undefined` = not loaded; `null` = no diff file yet; else parsed summary from Storage. */
+  const [diffSummary, setDiffSummary] = useState<DiffSummary | null | undefined>(undefined);
+  const [diffLoading, setDiffLoading] = useState(false);
+  const [showAdvancedRulesJson, setShowAdvancedRulesJson] = useState(false);
+  /** After switching playlists, skip one debounced save so we do not POST the same doc we just loaded. */
+  const ignoreNextPlaylistAutosave = useRef(false);
+  const lastSyncedPlaylistId = useRef<string | null>(null);
+  const playlistAutosaveToken = useRef(0);
+  const [playlistAutosaveState, setPlaylistAutosaveState] = useState<"idle" | "saving" | "saved">("idle");
+  const [rulesJsonBlocked, setRulesJsonBlocked] = useState(false);
 
   const selected = useMemo(() => {
     const fromFs = playlists.find((p) => p.id === selectedPl);
@@ -245,12 +267,25 @@ export function App() {
     };
   }, [user]);
 
-  useEffect(() => {
-    if (!selected) return;
+  useLayoutEffect(() => {
+    if (!selectedPl) {
+      lastSyncedPlaylistId.current = null;
+      return;
+    }
+    if (!selected || selected.id !== selectedPl) return;
+    if (lastSyncedPlaylistId.current === selectedPl) return;
+    lastSyncedPlaylistId.current = selectedPl;
+    ignoreNextPlaylistAutosave.current = true;
+    setRulesJsonBlocked(false);
     setRulesJson(JSON.stringify(selected.rules ?? JSON.parse(defaultRulesJson), null, 2));
     setEnrich(Boolean(selected.enrichEnabled));
     setDupLatest(selected.duplicateNewIntoLatest !== false);
-  }, [selected]);
+  }, [selectedPl, selected]);
+
+  useEffect(() => {
+    setDiffSummary(undefined);
+    setDiffLoading(false);
+  }, [selectedPl]);
 
   const notify = useCallback((msg: string) => {
     setToast(msg);
@@ -347,7 +382,7 @@ export function App() {
         duplicateNewIntoLatest: true,
       });
       setSelectedPl(id);
-      notify("Playlist created — use Fetch & rebuild M3U to generate the player file");
+      notify("Playlist created — open it and tap Rebuild M3U for player to generate the file your IPTV app will use");
     });
 
   const refreshPl = (id: string) =>
@@ -358,37 +393,70 @@ export function App() {
         timeout: 600_000,
       });
       await fn({ playlistId: id });
-      notify("M3U rebuilt from your sources");
+      notify("Rebuild finished — your player URL now serves the new merged M3U.");
     });
 
-  const savePl = (id: string) =>
-    run(async () => {
+  useEffect(() => {
+    if (!selectedPl || !selected || selected.id !== selectedPl) return;
+    if (ignoreNextPlaylistAutosave.current) {
+      ignoreNextPlaylistAutosave.current = false;
+      return;
+    }
+    const t = window.setTimeout(() => {
       let rules: Record<string, unknown>;
       try {
         rules = JSON.parse(rulesJson) as Record<string, unknown>;
+        setRulesJsonBlocked(false);
       } catch {
-        throw new Error("Rules JSON is invalid");
+        setRulesJsonBlocked(true);
+        setPlaylistAutosaveState("idle");
+        return;
       }
-      const u = callable<
-        { id: string; rules: Record<string, unknown>; enrichEnabled: boolean; duplicateNewIntoLatest: boolean },
-        { ok: boolean }
-      >("updatePlaylist");
-      await u({ id, rules, enrichEnabled: enrich, duplicateNewIntoLatest: dupLatest });
-      notify("Playlist settings saved");
-    });
+      const id = selectedPl;
+      const token = ++playlistAutosaveToken.current;
+      void (async () => {
+        setPlaylistAutosaveState("saving");
+        try {
+          const u = callable<
+            { id: string; rules: Record<string, unknown>; enrichEnabled: boolean; duplicateNewIntoLatest: boolean },
+            { ok: boolean }
+          >("updatePlaylist");
+          await u({ id, rules, enrichEnabled: enrich, duplicateNewIntoLatest: dupLatest });
+          if (token !== playlistAutosaveToken.current) return;
+          setPlaylistAutosaveState("saved");
+          window.setTimeout(() => {
+            setPlaylistAutosaveState((s) => (s === "saved" ? "idle" : s));
+          }, 2000);
+        } catch (e) {
+          if (token === playlistAutosaveToken.current) {
+            setPlaylistAutosaveState("idle");
+            notify(clientErrorMessage(e));
+          }
+        }
+      })();
+    }, 450);
+    return () => window.clearTimeout(t);
+  }, [rulesJson, enrich, dupLatest, selectedPl, selected?.id, notify]);
 
   const fetchDiff = (id: string) =>
     run(async () => {
-      const fn = callable<{ playlistId: string }, { summary: unknown }>("getDiffSummary");
-      const r = await fn({ playlistId: id });
-      setDiffText(JSON.stringify(r.data.summary, null, 2));
+      setDiffLoading(true);
+      try {
+        const fn = callable<{ playlistId: string }, { summary: unknown }>("getDiffSummary");
+        const r = await fn({ playlistId: id });
+        const raw = r.data.summary;
+        if (raw == null) setDiffSummary(null);
+        else setDiffSummary(raw as DiffSummary);
+      } finally {
+        setDiffLoading(false);
+      }
     });
 
   const rotate = (id: string) =>
     run(async () => {
       const fn = callable<{ playlistId: string }, { publicToken: string }>("rotatePlaylistToken");
       const r = await fn({ playlistId: id });
-      notify(`New token issued (${r.data.publicToken.slice(0, 8)}…)`);
+      notify(`New player URL issued — update your IPTV app. Old link no longer works (${r.data.publicToken.slice(0, 8)}…).`);
     });
 
   const removePl = (id: string) =>
@@ -401,9 +469,9 @@ export function App() {
 
   if (!user) {
     return (
-      <div className="min-h-screen flex items-center justify-center p-6 bg-gradient-to-b from-zinc-950 via-zinc-900 to-zinc-950">
-        <div className="w-full max-w-md rounded-2xl border border-zinc-800 bg-zinc-900/60 p-8 shadow-2xl backdrop-blur">
-          <h1 className="font-display text-3xl font-semibold tracking-tight text-white">IPTV List Manager</h1>
+      <div className="flex min-h-[100dvh] items-center justify-center bg-gradient-to-b from-zinc-950 via-zinc-900 to-zinc-950 p-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:p-6">
+        <div className="w-full max-w-md rounded-2xl border border-zinc-800 bg-zinc-900/60 p-5 shadow-2xl backdrop-blur sm:p-8">
+          <h1 className="font-display text-2xl font-semibold tracking-tight text-white sm:text-3xl">IPTV List Manager</h1>
           <p className="mt-2 text-sm text-zinc-400">
             Passwordless sign-in: we email you a link. New users are created automatically the first time they sign in.
           </p>
@@ -413,7 +481,7 @@ export function App() {
             <>
               <label className="mt-6 block text-xs font-medium uppercase tracking-wide text-zinc-500">Email</label>
               <input
-                className="mt-1 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm outline-none ring-emerald-500/40 focus:ring-2"
+                className="mt-1 min-h-11 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm outline-none ring-emerald-500/40 focus:ring-2 sm:min-h-0 sm:py-2"
                 value={email}
                 onChange={(e) => {
                   setEmail(e.target.value);
@@ -428,7 +496,7 @@ export function App() {
                 type="button"
                 disabled={busy || !email.trim()}
                 onClick={sendEmailLink}
-                className="mt-6 w-full rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-50"
+                className="mt-6 min-h-11 w-full rounded-lg bg-emerald-500 px-4 py-3 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-50 sm:py-2.5"
               >
                 Email me a sign-in link
               </button>
@@ -478,46 +546,315 @@ export function App() {
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-zinc-950 via-zinc-900 to-zinc-950 pb-16">
-      <header className="border-b border-zinc-800 bg-zinc-950/80 backdrop-blur sticky top-0 z-10">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-4">
-          <div>
-            <p className="font-display text-lg font-semibold text-white">IPTV List Manager</p>
-            <p className="text-xs text-zinc-500">Milestone build — merge, dedupe, filters, EPG passthrough, optional TMDB</p>
+    <div className="min-h-[100dvh] bg-gradient-to-b from-zinc-950 via-zinc-900 to-zinc-950 pb-[max(4rem,env(safe-area-inset-bottom,1rem))]">
+      <header className="sticky top-0 z-10 border-b border-zinc-800 bg-zinc-950/80 backdrop-blur">
+        <div className="mx-auto flex max-w-6xl flex-col gap-3 px-3 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 sm:px-4 sm:py-4">
+          <div className="min-w-0">
+            <p className="font-display text-base font-semibold text-white sm:text-lg">IPTV List Manager</p>
+            <p className="mt-0.5 text-xs text-zinc-500">Merge, dedupe, filters, EPG, optional TMDB</p>
           </div>
-          <div className="flex items-center gap-3">
-            <span className="hidden text-sm text-zinc-400 sm:inline">{user.email}</span>
-            <button type="button" onClick={logout} className="rounded-lg border border-zinc-700 px-3 py-1.5 text-sm hover:bg-zinc-800">
+          <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+            <span className="max-w-[min(100%,20rem)] truncate text-xs text-zinc-400 sm:max-w-none sm:text-sm">{user.email}</span>
+            <button
+              type="button"
+              onClick={logout}
+              className="min-h-10 shrink-0 rounded-lg border border-zinc-700 px-3 py-2 text-sm hover:bg-zinc-800 sm:py-1.5"
+            >
               Sign out
             </button>
           </div>
         </div>
       </header>
 
-      <main className="mx-auto max-w-6xl space-y-8 px-4 py-8">
-        <div className="rounded-2xl border border-zinc-800/80 bg-zinc-900/30 p-5 text-sm leading-relaxed text-zinc-300">
+      <main className="mx-auto max-w-6xl space-y-6 px-3 py-6 sm:space-y-8 sm:px-4 sm:py-8">
+        <div className="rounded-2xl border border-zinc-800/80 bg-zinc-900/30 p-4 text-sm leading-relaxed text-zinc-300 sm:p-5">
           <p className="font-medium text-zinc-100">How this screen is laid out</p>
           <ul className="mt-3 list-inside list-disc space-y-2 text-zinc-400 marker:text-zinc-600">
             <li>
-              <span className="text-zinc-200">Left — original M3U inputs:</span> paste each provider’s{" "}
-              <strong className="font-normal text-zinc-300">raw M3U URL</strong>.{" "}
-              <span className="text-zinc-200">Add to my sources</span> saves it; saved rows are the pool you pick from on
-              the right.
+              <span className="text-zinc-200">Top — your output playlists:</span> pick a hosted playlist,{" "}
+              <span className="text-zinc-200">Rebuild M3U for player</span> when you want fresh data, and copy the{" "}
+              <strong className="font-normal text-zinc-300">player URL</strong> for your IPTV app.
             </li>
             <li>
-              <span className="text-zinc-200">Right — your output playlist:</span> tick one or more saved sources, then{" "}
-              <span className="text-zinc-200">Create merged playlist</span>. That becomes a{" "}
-              <strong className="font-normal text-zinc-300">new hosted playlist</strong> this app builds (not the provider
-              link). Below, open it and use <span className="text-zinc-200">Fetch & rebuild M3U</span> to pull sources and
-              generate the M3U for your IPTV player.
+              <span className="text-zinc-200">Below that — Step 1 (left):</span> paste each provider’s{" "}
+              <strong className="font-normal text-zinc-300">raw M3U URL</strong>.{" "}
+              <span className="text-zinc-200">Add to my sources</span> saves it to your pool.
+            </li>
+            <li>
+              <span className="text-zinc-200">Step 2 (right):</span> tick sources, then{" "}
+              <span className="text-zinc-200">Create merged playlist</span> for a{" "}
+              <strong className="font-normal text-zinc-300">new</strong> hosted playlist (not the provider link).
             </li>
           </ul>
         </div>
 
-        <div className="grid gap-8 lg:grid-cols-2">
-          <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-6">
+        <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 sm:p-6">
+          <h2 className="font-display text-lg font-semibold text-white sm:text-xl">Your output playlists</h2>
+          <p className="mt-2 max-w-3xl text-sm text-zinc-400">
+            Pick a <strong className="font-medium text-zinc-300">hosted merged M3U</strong> below — settings and player link
+            open in one full-width panel so you scroll less.
+          </p>
+
+          <div className="mt-4 space-y-4">
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">Choose playlist</p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {displayPlaylists.map((p) => {
+                  const active = selectedPl === p.id;
+                  return (
+                    <button
+                      key={p.id}
+                      type="button"
+                      title={p.lastError ? p.lastError : undefined}
+                      onClick={() => setSelectedPl(p.id)}
+                      className={`max-w-full min-h-[3rem] rounded-xl border px-3 py-3 text-left transition sm:px-4 sm:py-2.5 ${
+                        active
+                          ? "border-emerald-500/50 bg-emerald-500/10 ring-1 ring-emerald-500/30"
+                          : "border-zinc-700 bg-zinc-900/60 hover:border-zinc-600 hover:bg-zinc-800/80"
+                      }`}
+                    >
+                      <span className="block truncate font-medium text-zinc-100">{p.name}</span>
+                      <span className="mt-0.5 block text-xs text-zinc-500">
+                        {p.channelCount != null ? `${p.channelCount} channels` : "Not generated yet"}
+                        {p.lastError ? ` · Error` : ""}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+              {displayPlaylists.length === 0 && (
+                <p className="mt-2 rounded-xl border border-dashed border-zinc-700 px-4 py-6 text-center text-sm text-zinc-500">
+                  No output playlists yet — add sources in Step 1, then create one in Step 2 below.
+                </p>
+              )}
+            </div>
+
+            {selected && (
+              <div className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-4 sm:p-5">
+                <div className="space-y-5">
+                  <div className="rounded-lg border border-zinc-800/80 bg-zinc-900/70 p-3 text-sm leading-relaxed text-zinc-400">
+                    <p className="font-medium text-zinc-200">Three ideas that clear up the buttons</p>
+                    <ul className="mt-2 list-inside list-disc space-y-1.5 marker:text-zinc-600">
+                      <li>
+                        <strong className="font-normal text-zinc-300">Rebuild</strong> = the server downloads your provider
+                        M3Us, merges them, applies filters, and overwrites the hosted file. Your IPTV app only ever sees that
+                        hosted file — not your raw provider links.
+                      </li>
+                      <li>
+                        <strong className="font-normal text-zinc-300">Options and rules</strong> save automatically when you
+                        change them here or in the visual editor. They take effect on the <em>next</em> rebuild.
+                      </li>
+                      <li>
+                        <strong className="font-normal text-zinc-300">“What changed”</strong> = a short count from the last
+                        rebuild vs the one before (new / removed-ish lines). It does not change anything by itself.
+                      </li>
+                    </ul>
+                  </div>
+
+                  <section className="rounded-lg border border-emerald-900/40 bg-emerald-950/15 p-4">
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-emerald-400/90">1 · Update the file your player uses</h3>
+                    <p className="mt-1 text-sm text-zinc-400">
+                      This is the important step. It can take a while on large playlists. Your TV app keeps polling the same
+                      player URL; it gets new content after a rebuild finishes.
+                    </p>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => refreshPl(selected.id)}
+                      className="mt-3 min-h-11 w-full rounded-lg bg-emerald-500 px-4 py-3 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-40 sm:w-auto sm:py-2.5"
+                    >
+                      Rebuild M3U for player
+                    </button>
+                  </section>
+
+                  <section className="rounded-lg border border-sky-900/35 bg-sky-950/10 p-4">
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-sky-400/90">2 · Browse channels &amp; build filters visually</h3>
+                    <p className="mt-1 text-sm text-zinc-400">
+                      The editor shows channels from your <strong className="font-normal text-zinc-300">last successful rebuild</strong>.
+                      You can add “hide this group” style rules there — they save automatically; still run{" "}
+                      <strong className="font-normal text-zinc-300">Rebuild</strong> here (or inside the editor) so the player file updates.
+                    </p>
+                    <Link
+                      to={`organize/${selected.id}`}
+                      className="mt-3 inline-flex min-h-11 w-full items-center justify-center rounded-lg border border-sky-600/50 bg-sky-500/15 px-4 py-3 text-sm font-medium text-sky-100 hover:bg-sky-500/25 sm:w-auto sm:py-2"
+                    >
+                      Open visual playlist editor
+                    </Link>
+                  </section>
+
+                  <section className="rounded-lg border border-zinc-800 p-4">
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">3 · Options &amp; rules</h3>
+                    <p className="mt-1 text-sm text-zinc-400">
+                      TMDB / “Latest” checkboxes and the JSON below (if you use it) are stored in your playlist document as you
+                      change them — no separate save step.
+                    </p>
+                    <p className="mt-2 text-xs text-zinc-500" aria-live="polite">
+                      {playlistAutosaveState === "saving" ? (
+                        <span className="text-sky-300/90">Saving…</span>
+                      ) : playlistAutosaveState === "saved" ? (
+                        <span className="text-emerald-300/90">Saved</span>
+                      ) : rulesJsonBlocked ? (
+                        <span className="text-amber-300/90">Auto-save paused — fix rules JSON so it parses.</span>
+                      ) : (
+                        <span>Changes save automatically.</span>
+                      )}
+                    </p>
+                  </section>
+
+                  <section className="rounded-lg border border-zinc-800 p-4">
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">4 · What changed at the last rebuild?</h3>
+                    <p className="mt-1 text-sm text-zinc-400">
+                      After each rebuild we store a tiny summary (not the full channel list): how many channels, how many
+                      looked new vs the previous run, approximate removals.
+                    </p>
+                    <button
+                      type="button"
+                      disabled={busy || diffLoading}
+                      onClick={() => fetchDiff(selected.id)}
+                      className="mt-3 min-h-11 w-full rounded-lg border border-zinc-600 px-4 py-3 text-sm hover:bg-zinc-800 disabled:opacity-40 sm:w-auto sm:py-2"
+                    >
+                      {diffLoading ? "Loading…" : diffSummary !== undefined ? "Refresh comparison" : "Load comparison"}
+                    </button>
+                    {diffSummary === null && (
+                      <p className="mt-3 text-sm text-zinc-500">
+                        No summary file yet — run <strong className="font-normal text-zinc-400">Rebuild M3U for player</strong>{" "}
+                        at least once. After the second rebuild you will see new vs previous counts.
+                      </p>
+                    )}
+                    {diffSummary != null && diffSummary !== undefined && (
+                      <div className="mt-3 rounded-lg border border-zinc-800 bg-zinc-950/60 p-3 text-sm text-zinc-300">
+                        <p className="text-xs text-zinc-500">
+                          Snapshot time:{" "}
+                          <span className="font-mono text-zinc-400">
+                            {(() => {
+                              try {
+                                return new Date(diffSummary.updatedAt).toLocaleString();
+                              } catch {
+                                return diffSummary.updatedAt;
+                              }
+                            })()}
+                          </span>
+                        </p>
+                        <ul className="mt-2 space-y-1.5 text-zinc-200">
+                          <li>
+                            Channels in merged playlist after this run:{" "}
+                            <strong className="font-semibold text-white">{diffSummary.currentCount}</strong>
+                          </li>
+                          <li>
+                            Channels that were not in the previous run (approx. “new” lines):{" "}
+                            <strong className="font-semibold text-emerald-300">{diffSummary.newCount}</strong>
+                          </li>
+                          <li>
+                            Lines that disappeared vs the previous run (approx.):{" "}
+                            <strong className="font-semibold text-amber-200">{diffSummary.removedApprox}</strong>
+                          </li>
+                          <li className="text-zinc-400">
+                            Previous run had <strong className="font-normal text-zinc-300">{diffSummary.previousCount}</strong>{" "}
+                            channels (used only for comparison).
+                          </li>
+                        </ul>
+                      </div>
+                    )}
+                  </section>
+
+                  <div>
+                    <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">Player URL</p>
+                    <code className="mt-1 block max-h-40 overflow-auto break-all rounded-lg bg-zinc-900 p-3 text-xs text-emerald-200 sm:max-h-none">
+                      {publicPlaylistUrl(selected.publicToken)}
+                    </code>
+                    <p className="mt-2 text-xs text-zinc-500">
+                      Paste this single URL into your IPTV app as the M3U playlist address. Rebuild whenever you want the
+                      server to pull fresh data from your sources and regenerate that file.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2 rounded-lg border border-zinc-800 p-4">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-zinc-500">Playlist options</p>
+                    <label className="flex cursor-pointer items-start gap-2 text-sm text-zinc-300">
+                      <input type="checkbox" className="mt-1" checked={enrich} onChange={(e) => setEnrich(e.target.checked)} />
+                      <span>
+                        Add TMDB descriptions to names (needs <code className="text-xs text-zinc-500">TMDB_API_KEY</code>{" "}
+                        on Cloud Functions). Applies on the next rebuild.
+                      </span>
+                    </label>
+                    <label className="flex cursor-pointer items-start gap-2 text-sm text-zinc-300">
+                      <input type="checkbox" className="mt-1" checked={dupLatest} onChange={(e) => setDupLatest(e.target.checked)} />
+                      <span>
+                        Also list newly detected channels under &quot;Latest fetch&quot; (duplicate row, same stream) so they are
+                        easy to spot in the app.
+                      </span>
+                    </label>
+                  </div>
+
+                  <div className="rounded-lg border border-zinc-800">
+                    <button
+                      type="button"
+                      onClick={() => setShowAdvancedRulesJson((o) => !o)}
+                      className="flex min-h-11 w-full items-center justify-between px-4 py-3 text-left text-sm font-medium text-zinc-300 hover:bg-zinc-800/50"
+                    >
+                      <span>Advanced · edit rules as JSON</span>
+                      <span className="text-xs text-zinc-500">{showAdvancedRulesJson ? "Hide" : "Show"}</span>
+                    </button>
+                    {showAdvancedRulesJson && (
+                      <div className="border-t border-zinc-800 p-3">
+                        <p className="mb-2 text-xs text-zinc-500">
+                          Same data the visual editor edits: include/exclude regex lists, dedupe, group order, etc. Invalid JSON
+                          pauses auto-save until the document parses.
+                        </p>
+                        {rulesJsonBlocked ? (
+                          <p className="mb-2 text-xs text-amber-300/90">Fix the JSON below to resume saving.</p>
+                        ) : null}
+                        <label className="sr-only" htmlFor="rules-json">
+                          Rules JSON
+                        </label>
+                        <textarea
+                          id="rules-json"
+                          className="h-48 w-full rounded-lg border border-zinc-700 bg-zinc-950 p-3 font-mono text-xs leading-relaxed text-zinc-200 sm:h-56"
+                          value={rulesJson}
+                          onChange={(e) => setRulesJson(e.target.value)}
+                        />
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex flex-wrap gap-2 border-t border-zinc-800 pt-4">
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => rotate(selected.id)}
+                      className="min-h-10 w-full rounded-lg border border-amber-800/50 px-3 py-2.5 text-left text-sm text-amber-200 hover:bg-amber-500/10 disabled:opacity-40 sm:w-auto sm:py-1.5"
+                    >
+                      New player link (invalidate old URL)
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => removePl(selected.id)}
+                      className="min-h-10 w-full rounded-lg border border-red-800/60 px-3 py-2.5 text-left text-sm text-red-300 hover:bg-red-500/10 disabled:opacity-40 sm:w-auto sm:py-1.5"
+                    >
+                      Delete playlist
+                    </button>
+                    <p className="w-full text-xs text-zinc-500">
+                      <strong className="font-normal text-zinc-400">New player link</strong> — your IPTV app must use the new
+                      URL; the old token stops working. Use if a link was leaked.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {!selectedPl && displayPlaylists.length > 0 && (
+              <p className="rounded-xl border border-dashed border-zinc-700 bg-zinc-950/30 px-4 py-8 text-center text-sm text-zinc-500">
+                Choose a playlist above to rebuild, edit rules, and copy the player URL.
+              </p>
+            )}
+          </div>
+        </section>
+
+        <div className="grid gap-6 lg:grid-cols-2 lg:gap-8">
+          <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 sm:p-6">
             <p className="text-xs font-medium uppercase tracking-wide text-emerald-600/90">Step 1 · Inputs</p>
-            <h2 className="font-display mt-1 text-xl font-semibold text-white">Your source M3U URLs</h2>
+            <h2 className="font-display mt-1 text-lg font-semibold text-white sm:text-xl">Your source M3U URLs</h2>
             <p className="mt-2 text-sm text-zinc-400">
               Each entry is one <strong className="font-medium text-zinc-300">original</strong> playlist URL from a
               provider. URLs are encrypted on the server and never shown back in full.
@@ -525,13 +862,13 @@ export function App() {
             <div className="mt-4 space-y-3">
               <input
                 placeholder="Label (e.g. Provider A)"
-                className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm"
+                className="min-h-11 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm sm:min-h-0 sm:py-2"
                 value={srcLabel}
                 onChange={(e) => setSrcLabel(e.target.value)}
               />
               <input
                 placeholder="https://…/playlist.m3u"
-                className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm"
+                className="min-h-11 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm sm:min-h-0 sm:py-2"
                 value={srcUrl}
                 onChange={(e) => setSrcUrl(e.target.value)}
               />
@@ -539,7 +876,7 @@ export function App() {
                 type="button"
                 disabled={busy || !srcUrl.trim()}
                 onClick={addSource}
-                className="w-full rounded-lg bg-emerald-500 py-2 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-40"
+                className="min-h-11 w-full rounded-lg bg-emerald-500 py-3 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-40 sm:py-2"
               >
                 Add to my sources
               </button>
@@ -548,8 +885,12 @@ export function App() {
             <ul className="mt-4 divide-y divide-zinc-800 rounded-xl border border-zinc-800">
               {sources.map((s) => (
                 <li key={s.id} className="flex items-center justify-between gap-3 px-3 py-3 text-sm">
-                  <span className="truncate text-zinc-200">{s.label}</span>
-                  <button type="button" className="text-xs text-red-400 hover:text-red-300" onClick={() => removeSource(s.id)}>
+                  <span className="min-w-0 flex-1 truncate text-zinc-200">{s.label}</span>
+                  <button
+                    type="button"
+                    className="min-h-10 shrink-0 rounded-md px-3 py-2 text-xs text-red-400 hover:bg-red-500/10 hover:text-red-300 sm:py-1"
+                    onClick={() => removeSource(s.id)}
+                  >
                     Remove
                   </button>
                 </li>
@@ -558,17 +899,18 @@ export function App() {
             </ul>
           </section>
 
-          <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-6">
+          <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 sm:p-6">
             <p className="text-xs font-medium uppercase tracking-wide text-sky-600/90">Step 2 · Output</p>
-            <h2 className="font-display mt-1 text-xl font-semibold text-white">Build a merged playlist from this app</h2>
+            <h2 className="font-display mt-1 text-lg font-semibold text-white sm:text-xl">Build a merged playlist from this app</h2>
             <p className="mt-2 text-sm text-zinc-400">
-              Choose which <strong className="font-medium text-zinc-300">saved sources</strong> (from the left) go into
-              one <strong className="font-medium text-zinc-300">new output playlist</strong>. That output gets its own
-              player link below — this is what you paste into your IPTV app, not the raw provider URLs.
+              Choose which <strong className="font-medium text-zinc-300">saved sources</strong> (from Step 1) go into one{" "}
+              <strong className="font-medium text-zinc-300">new output playlist</strong>. It appears in{" "}
+              <strong className="font-medium text-zinc-300">Your output playlists</strong> above with its own player link —
+              what you paste into your IPTV app, not the raw provider URLs.
             </p>
             <label className="mt-4 block text-xs font-medium uppercase tracking-wide text-zinc-500">Output playlist name</label>
             <input
-              className="mt-1 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm"
+              className="mt-1 min-h-11 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm sm:min-h-0 sm:py-2"
               value={plName}
               onChange={(e) => setPlName(e.target.value)}
               placeholder="e.g. Living room merged"
@@ -595,138 +937,16 @@ export function App() {
               type="button"
               disabled={busy || plSources.length === 0}
               onClick={createPl}
-              className="mt-4 w-full rounded-lg border border-emerald-700/60 bg-emerald-500/10 py-2 text-sm font-semibold text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-40"
+              className="mt-4 min-h-11 w-full rounded-lg border border-emerald-700/60 bg-emerald-500/10 py-3 text-sm font-semibold text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-40 sm:py-2"
             >
               Create merged playlist
             </button>
           </section>
         </div>
-
-        <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-6">
-          <h2 className="font-display text-xl font-semibold text-white">Your output playlists</h2>
-          <p className="mt-2 max-w-3xl text-sm text-zinc-400">
-            Each row is a <strong className="font-medium text-zinc-300">hosted merged M3U</strong> you manage here. Select
-            one to fetch sources again, edit merge rules, and copy the <strong className="font-medium text-zinc-300">player URL</strong> for your IPTV app.
-          </p>
-          <div className="mt-4 grid gap-4 lg:grid-cols-2">
-            <div className="rounded-xl border border-zinc-800">
-              {displayPlaylists.map((p) => (
-                <button
-                  key={p.id}
-                  type="button"
-                  onClick={() => setSelectedPl(p.id)}
-                  className={`flex w-full flex-col items-start gap-1 border-b border-zinc-800 px-4 py-3 text-left last:border-b-0 hover:bg-zinc-800/60 ${
-                    selectedPl === p.id ? "bg-zinc-800/80" : ""
-                  }`}
-                >
-                  <span className="font-medium text-zinc-100">{p.name}</span>
-                  <span className="text-xs text-zinc-500">
-                    {p.channelCount != null ? `${p.channelCount} channels` : "Not generated yet"}
-                    {p.lastError ? ` · Error: ${p.lastError}` : ""}
-                  </span>
-                </button>
-              ))}
-              {displayPlaylists.length === 0 && (
-                <p className="px-4 py-8 text-center text-sm text-zinc-500">No output playlists yet — create one above.</p>
-              )}
-            </div>
-
-            <div className="rounded-xl border border-zinc-800 bg-zinc-950/40 p-4">
-              {!selectedPl && <p className="text-sm text-zinc-500">Select an output playlist from the list.</p>}
-              {selected && (
-                <div className="space-y-4">
-                  <div className="flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => refreshPl(selected.id)}
-                      className="rounded-lg bg-emerald-500 px-3 py-1.5 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-40"
-                    >
-                      Fetch & rebuild M3U
-                    </button>
-                    <Link
-                      to={`organize/${selected.id}`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center rounded-lg border border-sky-700/50 bg-sky-500/10 px-3 py-1.5 text-sm font-medium text-sky-200 hover:bg-sky-500/15"
-                    >
-                      Open organizer
-                    </Link>
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => savePl(selected.id)}
-                      className="rounded-lg border border-zinc-600 px-3 py-1.5 text-sm hover:bg-zinc-800 disabled:opacity-40"
-                    >
-                      Save rules
-                    </button>
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => fetchDiff(selected.id)}
-                      className="rounded-lg border border-zinc-600 px-3 py-1.5 text-sm hover:bg-zinc-800 disabled:opacity-40"
-                    >
-                      Diff summary
-                    </button>
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => rotate(selected.id)}
-                      className="rounded-lg border border-amber-700/50 px-3 py-1.5 text-sm text-amber-200 hover:bg-amber-500/10 disabled:opacity-40"
-                    >
-                      Rotate URL
-                    </button>
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => removePl(selected.id)}
-                      className="rounded-lg border border-red-800/60 px-3 py-1.5 text-sm text-red-300 hover:bg-red-500/10 disabled:opacity-40"
-                    >
-                      Delete
-                    </button>
-                  </div>
-
-                  <div>
-                    <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">Player URL</p>
-                    <code className="mt-1 block break-all rounded-lg bg-zinc-900 p-3 text-xs text-emerald-200">
-                      {publicPlaylistUrl(selected.publicToken)}
-                    </code>
-                    <p className="mt-2 text-xs text-zinc-500">
-                      Paste into your IPTV app as an M3U URL. Use <span className="text-zinc-400">Fetch & rebuild M3U</span>{" "}
-                      the first time (and whenever you want to pull fresh data from your sources).
-                    </p>
-                  </div>
-
-                  <label className="flex items-center gap-2 text-sm text-zinc-300">
-                    <input type="checkbox" checked={enrich} onChange={(e) => setEnrich(e.target.checked)} />
-                    TMDB enrichment (requires <code className="text-xs text-zinc-400">TMDB_API_KEY</code> on Functions)
-                  </label>
-                  <label className="flex items-center gap-2 text-sm text-zinc-300">
-                    <input type="checkbox" checked={dupLatest} onChange={(e) => setDupLatest(e.target.checked)} />
-                    Duplicate “new” channels into Latest group (second line, same stream)
-                  </label>
-
-                  <label className="block text-xs font-medium uppercase tracking-wide text-zinc-500">Rules (JSON)</label>
-                  <textarea
-                    className="h-64 w-full rounded-lg border border-zinc-700 bg-zinc-950 p-3 font-mono text-xs leading-relaxed text-zinc-200"
-                    value={rulesJson}
-                    onChange={(e) => setRulesJson(e.target.value)}
-                  />
-
-                  {diffText && (
-                    <pre className="max-h-48 overflow-auto rounded-lg border border-zinc-800 bg-zinc-950 p-3 text-xs text-zinc-300">
-                      {diffText}
-                    </pre>
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
-        </section>
       </main>
 
       {toast && (
-        <div className="fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-full border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm text-zinc-100 shadow-xl">
+        <div className="fixed bottom-[max(1.5rem,env(safe-area-inset-bottom,0px))] left-1/2 z-50 max-w-[min(calc(100vw-1.5rem),28rem)] -translate-x-1/2 rounded-full border border-zinc-700 bg-zinc-900 px-4 py-3 text-center text-sm leading-snug text-zinc-100 shadow-xl sm:py-2">
           {toast}
         </div>
       )}

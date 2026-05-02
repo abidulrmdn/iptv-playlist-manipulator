@@ -4,6 +4,7 @@ These limits match the **IPTV Middleware MVP** product requirement: *hard caps s
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
+| `FETCH_M3U_TIMEOUT_MS` | 240,000 ms (4 min) | Per-source upstream HTTP GET (`refresh.ts`) |
 | `MAX_SOURCES_PER_USER` | 12 | Firestore + refresh fan-out |
 | `MAX_PLAYLISTS_PER_USER` | 15 | Per-user playlist count |
 | `MAX_CHANNELS_PER_PLAYLIST` | 35,000 | Parse memory / job time |
@@ -20,12 +21,13 @@ These limits match the **IPTV Middleware MVP** product requirement: *hard caps s
 - **Callable `refreshPlaylist`:** Gen2 — **540s** timeout, **1 GiB** memory (`functions/src/index.ts`).
 - **Scheduled batch:** at most **15** playlists per scheduler run (`limit(15)` query).
 - **Manual refresh:** same `runPlaylistRefresh` path as scheduled.
+- **Upstream fetch:** retries on transient HTTP/network errors; alternate **browser-like User-Agent** if the first profile fails; response must look like **M3U** (`#EXTM3U`), not HTML (captures wrong URLs / captive portals). Non-standard HTTP status codes (e.g. some proxies) produce an explicit error hint.
 
 ## Enforcement locations
 
 - `functions/src/constants.ts` — canonical `LIMITS` object.
 - `functions/src/index.ts` — `countUserSources` / `countUserPlaylists`, URL length, `createPlaylist` source checks.
-- `functions/src/refresh.ts` — `assertLimits`, M3U byte cap after merge.
+- `functions/src/refresh.ts` — `assertLimits`, M3U byte cap after merge, upstream `fetchM3u` timeout / retries.
 
 ## TMDB
 

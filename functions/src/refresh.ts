@@ -50,25 +50,117 @@ async function rotatePlaylistM3uSnapshots(bucket: Bucket, pref: string, retained
   if (em) await main.copy(snap(1));
 }
 
-async function fetchM3u(url: string): Promise<string> {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 120_000);
+function upstreamHost(url: string): string {
   try {
-    const res = await fetch(url, {
-      signal: ctrl.signal,
-      redirect: "follow",
-      headers: {
-        "User-Agent": "IPTV-List-Manager/1.0",
-        Accept: "application/vnd.apple.mpegurl, audio/x-mpegurl, */*",
-      },
-    });
-    if (!res.ok) throw new Error(`Upstream HTTP ${res.status}`);
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.length > LIMITS.MAX_M3U_BYTES) throw new Error("Upstream M3U exceeds size limit");
-    return buf.toString("utf8");
-  } finally {
-    clearTimeout(t);
+    return new URL(url).host;
+  } catch {
+    return "(invalid URL)";
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Statuses where a retry (or alternate User-Agent) may help. */
+const RETRYABLE_HTTP = new Set([408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524]);
+
+function assertBodyLooksLikeM3u(buf: Buffer, host: string): void {
+  const head = buf.toString("utf8", 0, Math.min(buf.length, 2048)).replace(/^\uFEFF/, "").trimStart();
+  if (head.startsWith("<!DOCTYPE") || head.startsWith("<html") || head.startsWith("<HTML")) {
+    throw new Error(
+      `Upstream returned HTML instead of a playlist (${host}). Wrong URL, login page, captive portal, or firewall.`,
+    );
+  }
+  if (!head.startsWith("#EXTM3U")) {
+    throw new Error(
+      `Upstream response is not an M3U (missing #EXTM3U) (${host}). Open the URL in a browser — it must be a raw playlist file.`,
+    );
+  }
+}
+
+function describeBadHttpStatus(status: number, statusText: string, host: string): string {
+  if (!Number.isFinite(status) || status < 100 || status > 599) {
+    return (
+      `non-standard HTTP status ${String(status)} from ${host}. ` +
+      `Often a corporate proxy, antivirus HTTPS inspection, or captive portal — try another network or VPN, or paste the URL in a normal browser tab.`
+    );
+  }
+  const st = statusText?.trim();
+  return `HTTP ${status}${st ? ` ${st}` : ""} from ${host}`;
+}
+
+/**
+ * Fetch provider M3U with retries and a browser-like User-Agent fallback (some CDNs block generic clients).
+ * iptv-org `index.m3u` and similar large lists are validated as real M3U after download.
+ */
+async function fetchM3u(url: string): Promise<string> {
+  const host = upstreamHost(url);
+  const headerVariants: Record<string, string>[] = [
+    {
+      "User-Agent": "IPTV-List-Manager/1.0 (merged M3U fetch; contact app operator)",
+      Accept: "application/vnd.apple.mpegurl, audio/x-mpegurl, application/x-mpegURL, text/plain, */*",
+      "Accept-Language": "en-US,en;q=0.9",
+    },
+    {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+      Accept: "*/*",
+      "Accept-Language": "en-US,en;q=0.9",
+    },
+  ];
+
+  const timeoutMs = LIMITS.FETCH_M3U_TIMEOUT_MS;
+  let lastProblem = "unknown error";
+
+  for (const headers of headerVariants) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), timeoutMs);
+      try {
+        const res = await fetch(url, {
+          signal: ctrl.signal,
+          redirect: "follow",
+          headers,
+        });
+        clearTimeout(t);
+
+        const status = res.status;
+        if (!Number.isFinite(status) || status < 100 || status > 599) {
+          lastProblem = describeBadHttpStatus(status, res.statusText, host);
+          break;
+        }
+
+        if (!res.ok) {
+          lastProblem = describeBadHttpStatus(status, res.statusText, host);
+          if (RETRYABLE_HTTP.has(status) && attempt < 2) {
+            await sleep(400 * (attempt + 1) ** 2);
+            continue;
+          }
+          break;
+        }
+
+        const buf = Buffer.from(await res.arrayBuffer());
+        if (buf.length > LIMITS.MAX_M3U_BYTES) throw new Error("Upstream M3U exceeds size limit");
+        assertBodyLooksLikeM3u(buf, host);
+        return buf.toString("utf8");
+      } catch (e) {
+        clearTimeout(t);
+        if (e instanceof Error && /Upstream M3U exceeds|HTML instead|not an M3U/i.test(e.message)) throw e;
+        lastProblem = e instanceof Error ? e.message : String(e);
+        const isAbort = e instanceof Error && (e.name === "AbortError" || /aborted/i.test(e.message));
+        const transientNet =
+          isAbort || /fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED/i.test(lastProblem);
+        if (transientNet && attempt < 2) {
+          await sleep(400 * (attempt + 1) ** 2);
+          continue;
+        }
+        break;
+      }
+    }
+  }
+
+  throw new Error(`Upstream fetch failed (${host}): ${lastProblem}`);
 }
 
 function buildFinalChannels(params: {

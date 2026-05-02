@@ -253,6 +253,7 @@ export const getPlaylistEditorData = onCall({ memory: "512MiB", timeoutSeconds: 
   }
   const data = snap.data() as {
     name?: string;
+    publicToken?: string;
     rules?: unknown;
     enrichEnabled?: boolean;
     duplicateNewIntoLatest?: boolean;
@@ -265,7 +266,7 @@ export const getPlaylistEditorData = onCall({ memory: "512MiB", timeoutSeconds: 
   if (!exists) {
     throw new HttpsError(
       "failed-precondition",
-      "No generated playlist file yet. Run “Fetch & rebuild M3U” on the main page first.",
+      "No generated playlist file yet. On the main app, run “Rebuild M3U for player” once first.",
     );
   }
 
@@ -292,6 +293,7 @@ export const getPlaylistEditorData = onCall({ memory: "512MiB", timeoutSeconds: 
 
   return {
     name: data.name ?? "Playlist",
+    publicToken: data.publicToken ?? "",
     rules: mergePlaylistRules(data.rules),
     channels,
     total,
@@ -302,6 +304,39 @@ export const getPlaylistEditorData = onCall({ memory: "512MiB", timeoutSeconds: 
     enrichEnabled,
     duplicateNewIntoLatest: data.duplicateNewIntoLatest !== false,
   };
+});
+
+/** All canonical channel ids for the organizer “select entire playlist” action (auth; re-reads Storage M3U). */
+export const getPlaylistEditorChannelIds = onCall({ memory: "512MiB", timeoutSeconds: 120 }, async (request) => {
+  requireAuth(request.auth?.uid);
+  const uid = request.auth!.uid;
+  const playlistId = String(request.data?.playlistId ?? "");
+  if (!playlistId) throw new HttpsError("invalid-argument", "Missing playlistId");
+
+  const snap = await db.collection("playlists").doc(playlistId).get();
+  if (!snap.exists || (snap.data() as { ownerUid?: string }).ownerUid !== uid) {
+    throw new HttpsError("not-found", "Playlist not found");
+  }
+
+  const objectPath = `users/${uid}/playlists/${playlistId}/playlist.m3u`;
+  const file = bucket.file(objectPath);
+  const [exists] = await file.exists();
+  if (!exists) {
+    throw new HttpsError(
+      "failed-precondition",
+      "No generated playlist file yet. On the main app, run “Rebuild M3U for player” once first.",
+    );
+  }
+
+  const [buf] = await file.download();
+  const text = buf.toString("utf8");
+  if (Buffer.byteLength(text, "utf8") > LIMITS.MAX_M3U_BYTES) {
+    throw new HttpsError("resource-exhausted", "Playlist file is too large for the editor");
+  }
+
+  const all = parseM3u(text);
+  const ids = all.map((ch) => canonicalId(ch));
+  return { total: ids.length, ids };
 });
 
 /** Public M3U for IPTV players (no auth). Use `?token=<publicToken>` or path ending in token.m3u */
