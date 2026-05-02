@@ -2,15 +2,24 @@
 
 A **Firebase** app that sits between IPTV providers and players: you add one or more **M3U URLs**, the backend **fetches, merges, dedupes, and filters** them, then serves a **single stable M3U URL** for your IPTV app. Provider URLs are **encrypted at rest**; the UI never shows them back in full.
 
+### Plan alignment (IPTV Middleware MVP)
+
+| Decision | This repo |
+|----------|-----------|
+| **Delivery shape** | **Phased A → B → C** (not one mega-release): stabilize core pipeline first, then TMDB, then snapshots/diff/NEW workflow. |
+| **Stack** | **Firebase**: Hosting (SPA), **Auth**, **Firestore**, **Storage**, **Cloud Functions** Gen2 (callables, `publicPlaylist`, scheduler). Player traffic reads **cached bytes from Storage** with **ETag** — no full refetch per player poll. |
+| **Cost / limits** | Hard caps in code + **[docs/LIMITS.md](docs/LIMITS.md)**; GCP **budget alerts** in **[docs/PRODUCTION.md](docs/PRODUCTION.md)** (Blaze required for outbound HTTPS). |
+| **Triage / per-channel PATCH** | **Diff summary** + **organizer UI** + rules cover v1 triage; granular `PATCH …/channels/:id` from the PRD is **deferred** until a follow-on iteration. |
+
 ---
 
 ## What’s implemented (shippable milestones)
 
 | Milestone | Features |
 |-----------|----------|
-| **A** | Passwordless **email link** auth, **encrypted** sources, playlists with **ordered** sources, **rules JSON** (filters, dedupe, group renames, group order), **manual refresh**, output written to **Cloud Storage**, **public** HTTPS endpoint `publicPlaylist`, **daily** scheduled refresh (cost-capped batch), hard **limits** in `functions/src/constants.ts`. |
-| **B** | Optional **TMDB** enrichment (playlist toggle + `TMDB_API_KEY` on Functions), TMDB attribution line in the M3U. |
-| **C** | **Snapshot** `canonical-ids.json`, **`diff-summary.json`**, after the first snapshot **new** streams get a **`[NEW]`** prefix on `group-title`, optional **duplicate** row into **“Latest fetch”** (same stream URL). |
+| **A** | Passwordless **email link** auth, **encrypted** sources, playlists with **ordered** sources, **rules JSON** (filters, dedupe, group renames, group order), **manual refresh**, output written to **Cloud Storage**, **public** HTTPS endpoint `publicPlaylist`, **weekly** scheduled refresh (Mondays 09:00 UTC, cost-capped batch of 15), hard **limits** in `functions/src/constants.ts` and **[docs/LIMITS.md](docs/LIMITS.md)**. |
+| **B** | Optional **TMDB** enrichment (playlist toggle + `TMDB_API_KEY` on Functions), bounded concurrency, **per-refresh query dedupe** (same title search → one TMDB HTTP call), TMDB attribution line in the M3U. |
+| **C** | **Snapshot** `canonical-ids.json`, **`diff-summary.json`**, rolling **M3U backups** (`playlist.snapshot-1.m3u` … per `SNAPSHOTS_RETAINED`), after the first snapshot **new** streams get a **`[NEW]`** prefix on `group-title`, optional **duplicate** row into **“Latest fetch”** (same stream URL), **visual organizer** + diff in UI. |
 
 **Cost note (from product plan):** keep usage small (weekly/daily refresh, bounded playlist size). Set **Google Cloud budget alerts** on the Firebase/GCP project.
 
@@ -31,6 +40,12 @@ A **Firebase** app that sits between IPTV providers and players: you add one or 
 | `firestore.rules` / `firestore.indexes.json` | Security rules + composite indexes for queries. |
 | `storage.rules` | Deny all **client** Storage access; only the **Admin SDK** in Functions reads/writes playlist blobs. |
 | `firebase.json` | Hosting, Functions, Firestore, Storage, emulator ports. |
+| `docs/LIMITS.md` | MVP **limits**, enforcement map, TMDB / snapshot notes. |
+| `docs/PRODUCTION.md` | Blaze, **budget alerts**, IAM, deploy checklist. |
+| `.cursor/rules/*.mdc` | **Cursor rules** (product + stack conventions). |
+| `docs/CURSOR_AGENT_GUIDE.md` | How agents/contributors use rules, skills, and verify commands. |
+| `AGENTS.md` | Short pointer to the agent guide and project skill. |
+| `.cursor/skills/iptv-middleware-mvp/` | Optional **Cursor skill** for refresh/limits/TMDB workflows. |
 
 ---
 

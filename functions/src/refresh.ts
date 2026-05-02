@@ -2,8 +2,8 @@ import { createHash } from "crypto";
 import { FieldValue, Timestamp, type Firestore } from "firebase-admin/firestore";
 import type { Bucket } from "@google-cloud/storage";
 import { decryptUtf8, type EncPayload } from "./crypto.js";
-import { DEFAULT_RULES, LIMITS, type PlaylistRules } from "./constants.js";
-import { applyRules } from "./rules.js";
+import { LIMITS, type PlaylistRules } from "./constants.js";
+import { applyRules, mergePlaylistRules } from "./rules.js";
 import { canonicalId, parseM3u, serializeM3u, type ChannelEntry } from "./m3u.js";
 import { enrichWithTmdb } from "./enrich.js";
 
@@ -36,6 +36,20 @@ function assertLimits(sourcesCount: number, channels: number) {
   }
 }
 
+/** Rotate `playlist.snapshot-*.m3u` before writing a new main file (Milestone C retention). */
+async function rotatePlaylistM3uSnapshots(bucket: Bucket, pref: string, retained: number): Promise<void> {
+  if (retained < 1) return;
+  const snap = (i: number) => bucket.file(`${pref}/playlist.snapshot-${i}.m3u`);
+  const main = bucket.file(`${pref}/playlist.m3u`);
+  await snap(retained).delete().catch(() => undefined);
+  for (let i = retained - 1; i >= 1; i--) {
+    const [ex] = await snap(i).exists();
+    if (ex) await snap(i).copy(snap(i + 1));
+  }
+  const [em] = await main.exists();
+  if (em) await main.copy(snap(1));
+}
+
 async function fetchM3u(url: string): Promise<string> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 120_000);
@@ -55,11 +69,6 @@ async function fetchM3u(url: string): Promise<string> {
   } finally {
     clearTimeout(t);
   }
-}
-
-function mergeRules(raw: unknown): PlaylistRules {
-  if (!raw || typeof raw !== "object") return { ...DEFAULT_RULES };
-  return { ...DEFAULT_RULES, ...(raw as PlaylistRules) };
 }
 
 function buildFinalChannels(params: {
@@ -119,7 +128,7 @@ export async function runPlaylistRefresh(params: {
   const playlist = pSnap.data() as PlaylistDoc;
   if (playlist.ownerUid !== ownerUid) throw new Error("Forbidden");
 
-  const rules = mergeRules(playlist.rules);
+  const rules = mergePlaylistRules(playlist.rules);
   const merged: ChannelEntry[] = [];
 
   for (const sid of playlist.sourceIds) {
@@ -175,6 +184,7 @@ export async function runPlaylistRefresh(params: {
 
   const etag = createHash("sha256").update(body).digest("hex").slice(0, 16);
   const mainPath = `${pref}/playlist.m3u`;
+  await rotatePlaylistM3uSnapshots(bucket, pref, LIMITS.SNAPSHOTS_RETAINED);
   await bucket.file(mainPath).save(body, {
     contentType: "audio/x-mpegurl",
     resumable: false,

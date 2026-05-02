@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   User,
   isSignInWithEmailLink,
@@ -8,9 +9,62 @@ import {
   signOut,
 } from "firebase/auth";
 import { collection, onSnapshot, orderBy, query, where } from "firebase/firestore";
-import { auth, callable, db, getEmailLinkContinueUrl, publicPlaylistUrl } from "./firebase";
+import {
+  auth,
+  callable,
+  db,
+  getAuthEmulatorOobCodesListUrl,
+  getEmailLinkContinueUrl,
+  publicPlaylistUrl,
+} from "./firebase";
+
+const DEV_TEST_EMAIL = "test@test.com";
 
 const EMAIL_LINK_STORAGE_KEY = "emailForSignIn";
+
+/** Survives React Strict Mode remounts so we only consume the email link once. */
+const EMAIL_LINK_OOB_GLOBAL = "__iptvListMgrEmailLinkOob";
+type WindowWithOob = Window & { [EMAIL_LINK_OOB_GLOBAL]?: string };
+
+function formatFunctionsDetails(details: unknown): string | undefined {
+  if (typeof details === "string" && details.trim()) return details.trim();
+  if (Array.isArray(details)) {
+    const parts = details
+      .map((d) => {
+        if (typeof d === "string") return d;
+        if (d && typeof d === "object" && "message" in d && typeof (d as { message: unknown }).message === "string") {
+          return (d as { message: string }).message;
+        }
+        return null;
+      })
+      .filter(Boolean) as string[];
+    if (parts.length) return parts.join(" · ");
+  }
+  return undefined;
+}
+
+function clientErrorMessage(e: unknown): string {
+  if (e instanceof Error) {
+    const fe = e as Error & { code?: string; details?: unknown };
+    const code = fe.code ?? "";
+    if (code === "functions/deadline-exceeded") {
+      return "That operation timed out (the server can take several minutes to download large M3Us). Try again, or use shorter source playlists.";
+    }
+    const msg = fe.message?.trim() ?? "";
+    if (msg && !/^internal$/i.test(msg) && msg !== "deadline-exceeded") return msg;
+    const fromDetails = formatFunctionsDetails(fe.details);
+    if (fromDetails) return fromDetails;
+    if (code.startsWith("functions/")) {
+      const c = code.replace(/^functions\//, "");
+      if (/^internal$/i.test(c)) {
+        return "Server error — check the Functions emulator terminal (common fix: valid ENCRYPTION_KEY in functions/.env, then restart emulators).";
+      }
+      return c.replace(/-/g, " ");
+    }
+    return msg || "Something went wrong";
+  }
+  return "Something went wrong";
+}
 
 type SourceRow = { id: string; label: string; createdAt?: { seconds?: number } };
 type PlaylistRow = {
@@ -53,6 +107,7 @@ export function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [linkSent, setLinkSent] = useState(false);
   const [completingLink, setCompletingLink] = useState(false);
+  const [devTestLoginUrl, setDevTestLoginUrl] = useState<string | null>(null);
 
   const [sources, setSources] = useState<SourceRow[]>([]);
   const [playlists, setPlaylists] = useState<PlaylistRow[]>([]);
@@ -64,12 +119,34 @@ export function App() {
   const [plSources, setPlSources] = useState<string[]>([]);
 
   const [selectedPl, setSelectedPl] = useState<string | null>(null);
+  /** Until Firestore snapshot includes a newly created playlist, keep a row so actions (e.g. refresh) still work. */
+  const [pendingPlaylist, setPendingPlaylist] = useState<PlaylistRow | null>(null);
   const [rulesJson, setRulesJson] = useState(defaultRulesJson);
   const [enrich, setEnrich] = useState(false);
   const [dupLatest, setDupLatest] = useState(true);
   const [diffText, setDiffText] = useState<string | null>(null);
 
-  const selected = useMemo(() => playlists.find((p) => p.id === selectedPl) ?? null, [playlists, selectedPl]);
+  const selected = useMemo(() => {
+    const fromFs = playlists.find((p) => p.id === selectedPl);
+    if (fromFs) return fromFs;
+    if (pendingPlaylist && pendingPlaylist.id === selectedPl) return pendingPlaylist;
+    return null;
+  }, [playlists, selectedPl, pendingPlaylist]);
+
+  useEffect(() => {
+    setPendingPlaylist((prev) => {
+      if (!prev) return null;
+      if (prev.id !== selectedPl) return null;
+      if (playlists.some((p) => p.id === prev.id)) return null;
+      return prev;
+    });
+  }, [selectedPl, playlists]);
+
+  const displayPlaylists = useMemo(() => {
+    if (!pendingPlaylist) return playlists;
+    if (playlists.some((p) => p.id === pendingPlaylist.id)) return playlists;
+    return [pendingPlaylist, ...playlists];
+  }, [playlists, pendingPlaylist]);
 
   useEffect(() => {
     return onAuthStateChanged(auth, setUser);
@@ -77,7 +154,24 @@ export function App() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    if (!isSignInWithEmailLink(auth, window.location.href)) return;
+    const href = window.location.href;
+    if (!isSignInWithEmailLink(auth, href)) return;
+
+    let oobCode: string;
+    try {
+      oobCode = new URL(href).searchParams.get("oobCode") ?? "";
+    } catch {
+      return;
+    }
+    if (!oobCode) return;
+
+    const w = window as WindowWithOob;
+    if (w[EMAIL_LINK_OOB_GLOBAL] === oobCode) {
+      window.history.replaceState({}, document.title, window.location.pathname);
+      setCompletingLink(false);
+      return;
+    }
+    w[EMAIL_LINK_OOB_GLOBAL] = oobCode;
 
     let cancelled = false;
     setCompletingLink(true);
@@ -88,19 +182,31 @@ export function App() {
           mail = window.prompt("Enter the same email address to complete sign-in")?.trim() ?? "";
         }
         if (!mail) throw new Error("Email is required to complete sign-in");
-        await signInWithEmailLink(auth, mail, window.location.href);
-        if (cancelled) return;
-        localStorage.removeItem(EMAIL_LINK_STORAGE_KEY);
+        await signInWithEmailLink(auth, mail, href);
         window.history.replaceState({}, document.title, window.location.pathname);
+        localStorage.removeItem(EMAIL_LINK_STORAGE_KEY);
+        delete w[EMAIL_LINK_OOB_GLOBAL];
+        if (cancelled) return;
         setToast("Signed in");
         setTimeout(() => setToast(null), 4200);
       } catch (e) {
+        delete w[EMAIL_LINK_OOB_GLOBAL];
+        const code = typeof e === "object" && e && "code" in e ? String((e as { code: string }).code) : "";
+        if (cancelled && code === "auth/invalid-action-code") {
+          return;
+        }
         if (!cancelled) {
-          setToast(e instanceof Error ? e.message : "Could not complete sign-in");
+          const msg =
+            code === "auth/invalid-action-code"
+              ? "Sign-in link expired or was already used. Request a new link."
+              : e instanceof Error
+                ? e.message
+                : "Could not complete sign-in";
+          setToast(msg);
           setTimeout(() => setToast(null), 5200);
         }
       } finally {
-        if (!cancelled) setCompletingLink(false);
+        setCompletingLink(false);
       }
     })();
 
@@ -156,7 +262,7 @@ export function App() {
     try {
       await fn();
     } catch (e) {
-      notify(e instanceof Error ? e.message : "Something went wrong");
+      notify(clientErrorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -174,6 +280,39 @@ export function App() {
       notify("Check your email for the sign-in link");
     });
 
+  /** Auth emulator does not send email; fetch the magic link from the emulator OOB API. */
+  const generateDevTestLoginUrl = () =>
+    run(async () => {
+      const listUrl = getAuthEmulatorOobCodesListUrl();
+      if (!listUrl) throw new Error("Dev login link only works with Vite dev + VITE_USE_EMULATOR=true");
+      const continueUrl = getEmailLinkContinueUrl();
+      if (!continueUrl) throw new Error("Could not build sign-in link URL");
+      setDevTestLoginUrl(null);
+      await sendSignInLinkToEmail(auth, DEV_TEST_EMAIL, { url: continueUrl, handleCodeInApp: true });
+      localStorage.setItem(EMAIL_LINK_STORAGE_KEY, DEV_TEST_EMAIL);
+
+      let oobLink: string | undefined;
+      for (let i = 0; i < 12; i++) {
+        const res = await fetch(listUrl);
+        if (!res.ok) throw new Error(`Auth emulator OOB list failed (${res.status})`);
+        const data = (await res.json()) as {
+          oobCodes?: { requestType?: string; email?: string; oobLink?: string }[];
+        };
+        const codes = data.oobCodes ?? [];
+        const match = [...codes].reverse().find(
+          (o) => o.requestType === "EMAIL_SIGNIN" && o.email?.toLowerCase() === DEV_TEST_EMAIL,
+        );
+        if (match?.oobLink) {
+          oobLink = match.oobLink;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      if (!oobLink) throw new Error("No sign-in link from Auth emulator (running on 127.0.0.1:9099?)");
+      setDevTestLoginUrl(oobLink);
+      notify("Open the link below to finish sign-in");
+    });
+
   const logout = () => signOut(auth);
 
   const addSource = () =>
@@ -181,7 +320,7 @@ export function App() {
       const upsert = callable<{ label: string; url: string }, { id: string }>("upsertSource");
       await upsert({ label: srcLabel.trim() || "Source", url: srcUrl.trim() });
       setSrcUrl("");
-      notify("Source saved (URL encrypted server-side)");
+      notify("Source added (URL encrypted server-side)");
     });
 
   const removeSource = (id: string) =>
@@ -194,16 +333,32 @@ export function App() {
   const createPl = () =>
     run(async () => {
       const c = callable<{ name: string; sourceIds: string[] }, { id: string; publicToken: string }>("createPlaylist");
-      const r = await c({ name: plName.trim() || "Playlist", sourceIds: plSources });
-      setSelectedPl(r.data.id);
-      notify("Playlist created — run Refresh to generate M3U");
+      const name = plName.trim() || "Playlist";
+      const sourceIds = [...plSources];
+      const r = await c({ name, sourceIds });
+      const id = r.data.id;
+      setPendingPlaylist({
+        id,
+        name,
+        publicToken: r.data.publicToken,
+        sourceIds,
+        rules: JSON.parse(defaultRulesJson) as Record<string, unknown>,
+        enrichEnabled: false,
+        duplicateNewIntoLatest: true,
+      });
+      setSelectedPl(id);
+      notify("Playlist created — use Fetch & rebuild M3U to generate the player file");
     });
 
   const refreshPl = (id: string) =>
     run(async () => {
-      const fn = callable<{ playlistId: string }, { ok: boolean; channelCount: number }>("refreshPlaylist");
+      if (!id) throw new Error("No playlist selected");
+      // Default callable timeout is 70s; refresh can take much longer (large M3Us + server limit 540s).
+      const fn = callable<{ playlistId: string }, { ok: boolean; channelCount: number }>("refreshPlaylist", {
+        timeout: 600_000,
+      });
       await fn({ playlistId: id });
-      notify("Refresh complete");
+      notify("M3U rebuilt from your sources");
     });
 
   const savePl = (id: string) =>
@@ -283,6 +438,37 @@ export function App() {
                   the link elsewhere.
                 </p>
               )}
+              {import.meta.env.DEV && import.meta.env.VITE_USE_EMULATOR === "true" && (
+                <div className="mt-8 rounded-xl border border-amber-900/40 bg-amber-950/20 p-4">
+                  <p className="text-xs font-medium uppercase tracking-wide text-amber-200/90">Local dev only</p>
+                  <p className="mt-1 text-sm text-zinc-400">
+                    One-time magic link for <span className="font-mono text-zinc-300">{DEV_TEST_EMAIL}</span> (Auth emulator
+                    does not send email).
+                  </p>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={generateDevTestLoginUrl}
+                    className="mt-3 w-full rounded-lg border border-amber-700/50 bg-amber-500/10 px-3 py-2 text-sm font-medium text-amber-100 hover:bg-amber-500/15 disabled:opacity-50"
+                  >
+                    Generate login link
+                  </button>
+                  {devTestLoginUrl && (
+                    <div className="mt-3 space-y-2">
+                      <a
+                        href={devTestLoginUrl}
+                        className="inline-block text-sm font-medium text-emerald-400 underline decoration-emerald-600/60 underline-offset-2 hover:text-emerald-300"
+                      >
+                        Open sign-in link
+                      </a>
+                      <p className="text-xs text-zinc-500">Or copy this URL:</p>
+                      <code className="block max-h-24 overflow-auto break-all rounded-lg bg-zinc-950 p-2 text-[11px] leading-snug text-zinc-400">
+                        {devTestLoginUrl}
+                      </code>
+                    </div>
+                  )}
+                </div>
+              )}
             </>
           )}
           {toast && <p className="mt-4 text-sm text-amber-300">{toast}</p>}
@@ -308,85 +494,123 @@ export function App() {
         </div>
       </header>
 
-      <main className="mx-auto grid max-w-6xl gap-8 px-4 py-8 lg:grid-cols-2">
-        <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-6">
-          <h2 className="font-display text-xl font-semibold text-white">Sources</h2>
-          <p className="mt-1 text-sm text-zinc-400">URLs are encrypted at rest. They are never shown back in full.</p>
-          <div className="mt-4 space-y-3">
+      <main className="mx-auto max-w-6xl space-y-8 px-4 py-8">
+        <div className="rounded-2xl border border-zinc-800/80 bg-zinc-900/30 p-5 text-sm leading-relaxed text-zinc-300">
+          <p className="font-medium text-zinc-100">How this screen is laid out</p>
+          <ul className="mt-3 list-inside list-disc space-y-2 text-zinc-400 marker:text-zinc-600">
+            <li>
+              <span className="text-zinc-200">Left — original M3U inputs:</span> paste each provider’s{" "}
+              <strong className="font-normal text-zinc-300">raw M3U URL</strong>.{" "}
+              <span className="text-zinc-200">Add to my sources</span> saves it; saved rows are the pool you pick from on
+              the right.
+            </li>
+            <li>
+              <span className="text-zinc-200">Right — your output playlist:</span> tick one or more saved sources, then{" "}
+              <span className="text-zinc-200">Create merged playlist</span>. That becomes a{" "}
+              <strong className="font-normal text-zinc-300">new hosted playlist</strong> this app builds (not the provider
+              link). Below, open it and use <span className="text-zinc-200">Fetch & rebuild M3U</span> to pull sources and
+              generate the M3U for your IPTV player.
+            </li>
+          </ul>
+        </div>
+
+        <div className="grid gap-8 lg:grid-cols-2">
+          <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-6">
+            <p className="text-xs font-medium uppercase tracking-wide text-emerald-600/90">Step 1 · Inputs</p>
+            <h2 className="font-display mt-1 text-xl font-semibold text-white">Your source M3U URLs</h2>
+            <p className="mt-2 text-sm text-zinc-400">
+              Each entry is one <strong className="font-medium text-zinc-300">original</strong> playlist URL from a
+              provider. URLs are encrypted on the server and never shown back in full.
+            </p>
+            <div className="mt-4 space-y-3">
+              <input
+                placeholder="Label (e.g. Provider A)"
+                className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm"
+                value={srcLabel}
+                onChange={(e) => setSrcLabel(e.target.value)}
+              />
+              <input
+                placeholder="https://…/playlist.m3u"
+                className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm"
+                value={srcUrl}
+                onChange={(e) => setSrcUrl(e.target.value)}
+              />
+              <button
+                type="button"
+                disabled={busy || !srcUrl.trim()}
+                onClick={addSource}
+                className="w-full rounded-lg bg-emerald-500 py-2 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-40"
+              >
+                Add to my sources
+              </button>
+            </div>
+            <p className="mt-3 text-xs text-zinc-500">Saved sources appear as checkboxes in step 2.</p>
+            <ul className="mt-4 divide-y divide-zinc-800 rounded-xl border border-zinc-800">
+              {sources.map((s) => (
+                <li key={s.id} className="flex items-center justify-between gap-3 px-3 py-3 text-sm">
+                  <span className="truncate text-zinc-200">{s.label}</span>
+                  <button type="button" className="text-xs text-red-400 hover:text-red-300" onClick={() => removeSource(s.id)}>
+                    Remove
+                  </button>
+                </li>
+              ))}
+              {sources.length === 0 && <li className="px-3 py-6 text-center text-sm text-zinc-500">No sources yet</li>}
+            </ul>
+          </section>
+
+          <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-6">
+            <p className="text-xs font-medium uppercase tracking-wide text-sky-600/90">Step 2 · Output</p>
+            <h2 className="font-display mt-1 text-xl font-semibold text-white">Build a merged playlist from this app</h2>
+            <p className="mt-2 text-sm text-zinc-400">
+              Choose which <strong className="font-medium text-zinc-300">saved sources</strong> (from the left) go into
+              one <strong className="font-medium text-zinc-300">new output playlist</strong>. That output gets its own
+              player link below — this is what you paste into your IPTV app, not the raw provider URLs.
+            </p>
+            <label className="mt-4 block text-xs font-medium uppercase tracking-wide text-zinc-500">Output playlist name</label>
             <input
-              placeholder="Label (e.g. Provider A)"
-              className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm"
-              value={srcLabel}
-              onChange={(e) => setSrcLabel(e.target.value)}
+              className="mt-1 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm"
+              value={plName}
+              onChange={(e) => setPlName(e.target.value)}
+              placeholder="e.g. Living room merged"
             />
-            <input
-              placeholder="https://…/playlist.m3u"
-              className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm"
-              value={srcUrl}
-              onChange={(e) => setSrcUrl(e.target.value)}
-            />
+            <p className="mt-4 text-xs font-medium uppercase tracking-wide text-zinc-500">Sources to merge (order preserved)</p>
+            <div className="mt-1 max-h-48 space-y-2 overflow-auto rounded-lg border border-zinc-800 p-2">
+              {sources.map((s) => (
+                <label key={s.id} className="flex cursor-pointer items-center gap-2 text-sm text-zinc-300">
+                  <input
+                    type="checkbox"
+                    checked={plSources.includes(s.id)}
+                    onChange={(e) => {
+                      setPlSources((prev) =>
+                        e.target.checked ? [...prev, s.id] : prev.filter((x) => x !== s.id),
+                      );
+                    }}
+                  />
+                  <span className="truncate">{s.label}</span>
+                </label>
+              ))}
+              {sources.length === 0 && <p className="text-sm text-zinc-500">Add at least one source on the left first.</p>}
+            </div>
             <button
               type="button"
-              disabled={busy || !srcUrl.trim()}
-              onClick={addSource}
-              className="w-full rounded-lg bg-emerald-500 py-2 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-40"
+              disabled={busy || plSources.length === 0}
+              onClick={createPl}
+              className="mt-4 w-full rounded-lg border border-emerald-700/60 bg-emerald-500/10 py-2 text-sm font-semibold text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-40"
             >
-              Save source
+              Create merged playlist
             </button>
-          </div>
-          <ul className="mt-6 divide-y divide-zinc-800 rounded-xl border border-zinc-800">
-            {sources.map((s) => (
-              <li key={s.id} className="flex items-center justify-between gap-3 px-3 py-3 text-sm">
-                <span className="truncate text-zinc-200">{s.label}</span>
-                <button type="button" className="text-xs text-red-400 hover:text-red-300" onClick={() => removeSource(s.id)}>
-                  Remove
-                </button>
-              </li>
-            ))}
-            {sources.length === 0 && <li className="px-3 py-6 text-center text-sm text-zinc-500">No sources yet</li>}
-          </ul>
-        </section>
+          </section>
+        </div>
 
         <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-6">
-          <h2 className="font-display text-xl font-semibold text-white">New playlist</h2>
-          <p className="mt-1 text-sm text-zinc-400">Pick one or more sources (merged in order).</p>
-          <input
-            className="mt-4 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm"
-            value={plName}
-            onChange={(e) => setPlName(e.target.value)}
-          />
-          <div className="mt-4 max-h-48 space-y-2 overflow-auto rounded-lg border border-zinc-800 p-2">
-            {sources.map((s) => (
-              <label key={s.id} className="flex cursor-pointer items-center gap-2 text-sm text-zinc-300">
-                <input
-                  type="checkbox"
-                  checked={plSources.includes(s.id)}
-                  onChange={(e) => {
-                    setPlSources((prev) =>
-                      e.target.checked ? [...prev, s.id] : prev.filter((x) => x !== s.id),
-                    );
-                  }}
-                />
-                <span className="truncate">{s.label}</span>
-              </label>
-            ))}
-            {sources.length === 0 && <p className="text-sm text-zinc-500">Add a source first.</p>}
-          </div>
-          <button
-            type="button"
-            disabled={busy || plSources.length === 0}
-            onClick={createPl}
-            className="mt-4 w-full rounded-lg border border-emerald-700/60 bg-emerald-500/10 py-2 text-sm font-semibold text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-40"
-          >
-            Create playlist
-          </button>
-        </section>
-
-        <section className="lg:col-span-2 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-6">
-          <h2 className="font-display text-xl font-semibold text-white">Playlists</h2>
+          <h2 className="font-display text-xl font-semibold text-white">Your output playlists</h2>
+          <p className="mt-2 max-w-3xl text-sm text-zinc-400">
+            Each row is a <strong className="font-medium text-zinc-300">hosted merged M3U</strong> you manage here. Select
+            one to fetch sources again, edit merge rules, and copy the <strong className="font-medium text-zinc-300">player URL</strong> for your IPTV app.
+          </p>
           <div className="mt-4 grid gap-4 lg:grid-cols-2">
             <div className="rounded-xl border border-zinc-800">
-              {playlists.map((p) => (
+              {displayPlaylists.map((p) => (
                 <button
                   key={p.id}
                   type="button"
@@ -402,11 +626,13 @@ export function App() {
                   </span>
                 </button>
               ))}
-              {playlists.length === 0 && <p className="px-4 py-8 text-center text-sm text-zinc-500">No playlists yet</p>}
+              {displayPlaylists.length === 0 && (
+                <p className="px-4 py-8 text-center text-sm text-zinc-500">No output playlists yet — create one above.</p>
+              )}
             </div>
 
             <div className="rounded-xl border border-zinc-800 bg-zinc-950/40 p-4">
-              {!selected && <p className="text-sm text-zinc-500">Select a playlist to edit.</p>}
+              {!selectedPl && <p className="text-sm text-zinc-500">Select an output playlist from the list.</p>}
               {selected && (
                 <div className="space-y-4">
                   <div className="flex flex-wrap gap-2">
@@ -416,8 +642,16 @@ export function App() {
                       onClick={() => refreshPl(selected.id)}
                       className="rounded-lg bg-emerald-500 px-3 py-1.5 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-40"
                     >
-                      Refresh now
+                      Fetch & rebuild M3U
                     </button>
+                    <Link
+                      to={`organize/${selected.id}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center rounded-lg border border-sky-700/50 bg-sky-500/10 px-3 py-1.5 text-sm font-medium text-sky-200 hover:bg-sky-500/15"
+                    >
+                      Open organizer
+                    </Link>
                     <button
                       type="button"
                       disabled={busy}
@@ -458,7 +692,8 @@ export function App() {
                       {publicPlaylistUrl(selected.publicToken)}
                     </code>
                     <p className="mt-2 text-xs text-zinc-500">
-                      Paste into your IPTV app as an M3U URL. First refresh generates the file.
+                      Paste into your IPTV app as an M3U URL. Use <span className="text-zinc-400">Fetch & rebuild M3U</span>{" "}
+                      the first time (and whenever you want to pull fresh data from your sources).
                     </p>
                   </div>
 

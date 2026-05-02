@@ -25,6 +25,8 @@ export const LIMITS = {
   /** Max concurrent TMDB lookups per refresh (Milestone B). */
   TMDB_CONCURRENCY: 4,
   SNAPSHOTS_RETAINED: 3,
+  /** Max channels returned per getPlaylistEditorData page (UX vs payload size). */
+  MAX_EDITOR_PAGE_SIZE: 1_500,
 } as const;
 
 export const DEFAULT_RULES: PlaylistRules = {

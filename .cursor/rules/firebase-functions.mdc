@@ -1,0 +1,13 @@
+---
+description: Cloud Functions conventions — refresh, limits, Storage layout
+globs: functions/**/*.ts
+alwaysApply: false
+---
+
+# Functions (`functions/src/`)
+
+- **Single source of limits:** Import `LIMITS` and `DEFAULT_RULES` from `./constants.js`. If you add a cap, update **`docs/LIMITS.md`** in the same change.
+- **Refresh pipeline:** `refresh.ts` — fetch sources → parse (`m3u.ts`) → rules (`rules.ts`) → optional TMDB (`enrich.ts`) → write `playlist.m3u`, `canonical-ids.json`, `diff-summary.json`, rotate `playlist.snapshot-*.m3u`. Callables and schedulers live in `index.ts`.
+- **Scheduled refresh:** Weekly (Mondays 09:00 UTC); `nextScheduledRefreshAt` is ~7 days after success. Keep batch sizes bounded (cost-capped scheduler loop).
+- **TMDB:** One server key (`TMDB_API_KEY`); respect `TMDB_CONCURRENCY`; dedupe in-flight lookups per refresh; attribution line in M3U when enrichment is on.
+- **Verify:** `npm run build -w functions` before claiming Functions work is done.

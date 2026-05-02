@@ -1,5 +1,10 @@
 import type { ChannelEntry } from "./m3u.js";
-import type { PlaylistRules } from "./constants.js";
+import { DEFAULT_RULES, type PlaylistRules } from "./constants.js";
+
+export function mergePlaylistRules(raw: unknown): PlaylistRules {
+  if (!raw || typeof raw !== "object") return { ...DEFAULT_RULES };
+  return { ...DEFAULT_RULES, ...(raw as PlaylistRules) };
+}
 
 function compileSafe(pattern: string): RegExp | null {
   try {

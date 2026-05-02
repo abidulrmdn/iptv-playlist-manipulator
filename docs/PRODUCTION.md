@@ -1,5 +1,7 @@
 # Production checklist (Firebase)
 
+**Stack (locked for MVP):** Firebase **Hosting**, **Auth**, **Firestore**, **Storage**, **Cloud Functions** (Gen2) — same as the IPTV Middleware MVP default; heavy parse stays in Functions with explicit **timeout / memory / limits** ([LIMITS.md](./LIMITS.md)). If a playlist routinely **times out or OOMs** despite caps, move only the **parse + merge** step to **Cloud Run** (longer timeout, more RAM) and keep Auth/Firestore/Hosting here.
+
 Use this in order for the full walkthrough (IAM, `gcloud`, TMDB, scheduler). The [README](../README.md) has a shorter **Deploy to production** summary.
 
 Replace `iptv-playlist-manipulator` if your Firebase project id differs (see [`.firebaserc`](../.firebaserc)).

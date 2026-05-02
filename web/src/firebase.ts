@@ -1,7 +1,12 @@
 import { initializeApp } from "firebase/app";
 import { connectAuthEmulator, getAuth } from "firebase/auth";
 import { connectFirestoreEmulator, getFirestore } from "firebase/firestore";
-import { connectFunctionsEmulator, getFunctions, httpsCallable } from "firebase/functions";
+import {
+  connectFunctionsEmulator,
+  getFunctions,
+  httpsCallable,
+  type HttpsCallableOptions,
+} from "firebase/functions";
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -24,8 +29,8 @@ if (import.meta.env.DEV && import.meta.env.VITE_USE_EMULATOR === "true") {
   connectFunctionsEmulator(functions, "127.0.0.1", 5001);
 }
 
-export function callable<TReq, TRes>(name: string) {
-  return httpsCallable<TReq, TRes>(functions, name);
+export function callable<TReq, TRes>(name: string, options?: HttpsCallableOptions) {
+  return httpsCallable<TReq, TRes>(functions, name, options);
 }
 
 /** Full URL Firebase may redirect to after the user clicks the email link (`handleCodeInApp: true`). */
@@ -34,6 +39,14 @@ export function getEmailLinkContinueUrl(): string {
   if (explicit) return explicit;
   if (typeof window === "undefined") return "";
   return new URL(import.meta.env.BASE_URL || "/", window.location.origin).href;
+}
+
+/** Auth emulator REST: list pending email-link codes (no auth; local dev only). */
+export function getAuthEmulatorOobCodesListUrl(): string | null {
+  if (!import.meta.env.DEV || import.meta.env.VITE_USE_EMULATOR !== "true") return null;
+  const pid = import.meta.env.VITE_FIREBASE_PROJECT_ID;
+  if (!pid) return null;
+  return `http://127.0.0.1:9099/emulator/v1/projects/${encodeURIComponent(pid)}/oobCodes`;
 }
 
 export function publicPlaylistUrl(publicToken: string): string {

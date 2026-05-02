@@ -1,4 +1,6 @@
-import "dotenv/config";
+import fs from "node:fs";
+import path from "node:path";
+import dotenv from "dotenv";
 import { randomBytes } from "crypto";
 import { initializeApp } from "firebase-admin/app";
 import { FieldValue, getFirestore, Timestamp } from "firebase-admin/firestore";
@@ -8,7 +10,14 @@ import { onSchedule } from "firebase-functions/v2/scheduler";
 import { setGlobalOptions } from "firebase-functions/v2/options";
 import { encryptUtf8 } from "./crypto.js";
 import { DEFAULT_RULES, LIMITS } from "./constants.js";
+import { classifyEditorTab } from "./editorTab.js";
+import { canonicalId, parseM3u } from "./m3u.js";
+import { mergePlaylistRules } from "./rules.js";
 import { runPlaylistRefresh } from "./refresh.js";
+
+for (const p of [path.join(process.cwd(), ".env"), path.join(process.cwd(), "functions", ".env")]) {
+  if (fs.existsSync(p)) dotenv.config({ path: p });
+}
 
 initializeApp();
 const db = getFirestore();
@@ -20,14 +29,23 @@ function requireAuth(uid: string | undefined): asserts uid is string {
   if (!uid) throw new HttpsError("unauthenticated", "Sign in required");
 }
 
+/** Avoid aggregation `count()` quirks in some emulator versions. */
 async function countUserSources(uid: string): Promise<number> {
-  const q = await db.collection("sources").where("ownerUid", "==", uid).count().get();
-  return q.data().count;
+  const snap = await db
+    .collection("sources")
+    .where("ownerUid", "==", uid)
+    .limit(LIMITS.MAX_SOURCES_PER_USER + 1)
+    .get();
+  return snap.size;
 }
 
 async function countUserPlaylists(uid: string): Promise<number> {
-  const q = await db.collection("playlists").where("ownerUid", "==", uid).count().get();
-  return q.data().count;
+  const snap = await db
+    .collection("playlists")
+    .where("ownerUid", "==", uid)
+    .limit(LIMITS.MAX_PLAYLISTS_PER_USER + 1)
+    .get();
+  return snap.size;
 }
 
 export const upsertSource = onCall(async (request) => {
@@ -47,7 +65,21 @@ export const upsertSource = onCall(async (request) => {
     throw new HttpsError("resource-exhausted", "Source limit reached");
   }
 
-  const urlEnc = encryptUtf8(url);
+  let urlEnc: ReturnType<typeof encryptUtf8>;
+  try {
+    urlEnc = encryptUtf8(url);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("ENCRYPTION_KEY")) {
+      throw new HttpsError(
+        "failed-precondition",
+        "ENCRYPTION_KEY is missing or not 32 bytes after base64 decode. Set it in functions/.env (run: openssl rand -base64 32). Restart emulators after changing it.",
+      );
+    }
+    console.error("upsertSource encrypt error", err);
+    throw new HttpsError("internal", "Could not encrypt source URL");
+  }
+
   const id = String(request.data?.id ?? "");
   if (id) {
     const ref = db.collection("sources").doc(id);
@@ -184,7 +216,8 @@ export const refreshPlaylist = onCall({ memory: "1GiB", timeoutSeconds: 540 }, a
         .doc(playlistId)
         .update({ lastError: msg, updatedAt: FieldValue.serverTimestamp() })
         .catch(() => undefined);
-      throw new HttpsError("internal", msg);
+      // Use failed-precondition so the client surfaces `message` instead of a generic internal code.
+      throw new HttpsError("failed-precondition", msg);
     }
 });
 
@@ -202,6 +235,73 @@ export const getDiffSummary = onCall(async (request) => {
   if (!exists) return { summary: null };
   const [buf] = await f.download();
   return { summary: JSON.parse(buf.toString("utf8")) };
+});
+
+/** Paginated channel rows + rules for the visual playlist organizer (auth). */
+export const getPlaylistEditorData = onCall({ memory: "512MiB", timeoutSeconds: 120 }, async (request) => {
+  requireAuth(request.auth?.uid);
+  const uid = request.auth!.uid;
+  const playlistId = String(request.data?.playlistId ?? "");
+  if (!playlistId) throw new HttpsError("invalid-argument", "Missing playlistId");
+  const offset = Math.max(0, Math.floor(Number((request.data as { offset?: unknown })?.offset ?? 0)));
+  const limitRaw = Math.floor(Number((request.data as { limit?: unknown })?.limit ?? LIMITS.MAX_EDITOR_PAGE_SIZE));
+  const limit = Math.min(LIMITS.MAX_EDITOR_PAGE_SIZE, Math.max(50, limitRaw));
+
+  const snap = await db.collection("playlists").doc(playlistId).get();
+  if (!snap.exists || (snap.data() as { ownerUid?: string }).ownerUid !== uid) {
+    throw new HttpsError("not-found", "Playlist not found");
+  }
+  const data = snap.data() as {
+    name?: string;
+    rules?: unknown;
+    enrichEnabled?: boolean;
+    duplicateNewIntoLatest?: boolean;
+    etag?: string;
+  };
+
+  const objectPath = `users/${uid}/playlists/${playlistId}/playlist.m3u`;
+  const file = bucket.file(objectPath);
+  const [exists] = await file.exists();
+  if (!exists) {
+    throw new HttpsError(
+      "failed-precondition",
+      "No generated playlist file yet. Run “Fetch & rebuild M3U” on the main page first.",
+    );
+  }
+
+  const [buf] = await file.download();
+  const text = buf.toString("utf8");
+  if (Buffer.byteLength(text, "utf8") > LIMITS.MAX_M3U_BYTES) {
+    throw new HttpsError("resource-exhausted", "Playlist file is too large for the editor");
+  }
+
+  const all = parseM3u(text);
+  const total = all.length;
+  const slice = all.slice(offset, offset + limit);
+  const enrichEnabled = Boolean(data.enrichEnabled);
+
+  const channels = slice.map((ch) => ({
+    id: canonicalId(ch),
+    title: ch.title,
+    groupTitle: ch.groupTitle ?? "",
+    url: ch.url,
+    tvgLogo: ch.tvgLogo,
+    tvgName: ch.tvgName,
+    tab: classifyEditorTab(ch),
+  }));
+
+  return {
+    name: data.name ?? "Playlist",
+    rules: mergePlaylistRules(data.rules),
+    channels,
+    total,
+    offset,
+    limit,
+    hasMore: offset + channels.length < total,
+    etag: data.etag ?? "",
+    enrichEnabled,
+    duplicateNewIntoLatest: data.duplicateNewIntoLatest !== false,
+  };
 });
 
 /** Public M3U for IPTV players (no auth). Use `?token=<publicToken>` or path ending in token.m3u */
@@ -253,9 +353,9 @@ export const publicPlaylist = onRequest({ cors: false, memory: "512MiB" }, async
   res.status(200).send(buf.toString("utf8"));
 });
 
-/** Weekly-ish refresh for playlists that are due (cost-capped batch). */
+/** Weekly refresh window (MVP plan): Mondays 09:00 UTC; cost-capped batch (15 playlists max per run). */
 export const scheduledPlaylistRefresh = onSchedule(
-  { schedule: "every day 09:00", timeZone: "Etc/UTC", memory: "1GiB", timeoutSeconds: 540 },
+  { schedule: "0 9 * * 1", timeZone: "Etc/UTC", memory: "1GiB", timeoutSeconds: 540 },
   async () => {
     const snap = await db
       .collection("playlists")

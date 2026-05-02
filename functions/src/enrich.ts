@@ -39,13 +39,31 @@ async function fetchTmdb(apiKey: string, query: string): Promise<{ line: string 
   const name = hit.title ?? hit.name ?? "";
   const ov = (hit.overview ?? "").replace(/\s+/g, " ").trim().slice(0, 160);
   if (!name && !ov) return null;
-  const line = [name && `TMDB: ${name}`, ov && `— ${ov}`].filter(Boolean).join(" ");
+  const kind = hit.media_type === "movie" ? "movie" : "tv";
+  const line = [name && `TMDB(${kind}): ${name}`, ov && `— ${ov}`].filter(Boolean).join(" ");
   return { line };
+}
+
+/** One in-flight / completed TMDB response per distinct search query per refresh (Milestone B). */
+function tmdbPromiseForQuery(
+  apiKey: string,
+  query: string,
+  inflight: Map<string, Promise<{ line: string } | null>>,
+): Promise<{ line: string } | null> {
+  const key = query.toLowerCase();
+  let p = inflight.get(key);
+  if (!p) {
+    p = fetchTmdb(apiKey, query);
+    inflight.set(key, p);
+  }
+  return p;
 }
 
 /** Run TMDB enrichment with bounded concurrency; mutates titles in-place. */
 export async function enrichWithTmdb(entries: ChannelEntry[], apiKey: string | undefined): Promise<void> {
   if (!apiKey) return;
+
+  const tmdbInflight = new Map<string, Promise<{ line: string } | null>>();
 
   const queue = entries
     .map((ch, idx) => ({ ch, idx }))
@@ -59,7 +77,7 @@ export async function enrichWithTmdb(entries: ChannelEntry[], apiKey: string | u
       const q = cleanTitleForSearch(ch.title);
       if (q.length < 2) continue;
       try {
-        const r = await fetchTmdb(apiKey, q);
+        const r = await tmdbPromiseForQuery(apiKey, q, tmdbInflight);
         if (r) {
           entries[idx] = { ...ch, title: `${ch.title} (${r.line})` };
         }

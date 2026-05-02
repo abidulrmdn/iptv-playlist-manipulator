@@ -1,0 +1,12 @@
+---
+description: Vite + React web app — Firebase client, routing, organizer UX
+globs: web/**/*.{ts,tsx}
+alwaysApply: false
+---
+
+# Web (`web/`)
+
+- **Stack:** Vite, React, Firebase **client** SDK for Auth/Firestore/Functions callables. Production config via `web/.env` (`VITE_FIREBASE_*`); do not commit secrets.
+- **Emulators:** Root `npm run up` runs emulators + web dev server; set `VITE_USE_EMULATOR=true` for local only.
+- **Patterns:** Match existing components and hooks; keep playlist/source mutations behind callables already defined in `functions/src/index.ts`.
+- **Verify:** `npm run build -w web` after substantive UI changes.
