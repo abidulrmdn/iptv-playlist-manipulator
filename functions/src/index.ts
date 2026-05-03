@@ -3,19 +3,20 @@ import path from "node:path";
 import dotenv from "dotenv";
 import { randomBytes } from "crypto";
 import { initializeApp } from "firebase-admin/app";
-import { FieldValue, getFirestore, Timestamp } from "firebase-admin/firestore";
+import { FieldValue, getFirestore, Timestamp, type DocumentSnapshot } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
 import { defineSecret } from "firebase-functions/params";
 import { HttpsError, onCall, onRequest } from "firebase-functions/v2/https";
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import { setGlobalOptions } from "firebase-functions/v2/options";
-import { encryptUtf8 } from "./crypto.js";
+import { decryptUtf8, encryptUtf8 } from "./crypto.js";
 import { DEFAULT_RULES, LIMITS } from "./constants.js";
 import { classifyEditorTab } from "./editorTab.js";
 import { buildExcludeNamePatternsFromTitles } from "./excludeNamePatternChunks.js";
 import { canonicalId, parseM3u } from "./m3u.js";
 import { mergePlaylistRules } from "./rules.js";
 import { runPlaylistRefresh } from "./refresh.js";
+import { normalizeXtreamBaseUrl } from "./xtream.js";
 
 for (const p of [path.join(process.cwd(), ".env"), path.join(process.cwd(), "functions", ".env")]) {
   if (fs.existsSync(p)) dotenv.config({ path: p });
@@ -71,23 +72,12 @@ export const upsertSource = onCall({ ...RUN_INVOKER_PUBLIC, secrets: [encryption
     hasEnvKey: Boolean(process.env.ENCRYPTION_KEY?.trim()),
   });
   const label = String(request.data?.label ?? "").slice(0, LIMITS.MAX_LABEL_LENGTH);
-  const url = String(request.data?.url ?? "");
-  if (!url || url.length > LIMITS.MAX_SOURCE_URL_LENGTH) {
-    throw new HttpsError("invalid-argument", "Invalid source URL");
-  }
-  if (!(url.startsWith("http://") || url.startsWith("https://"))) {
-    throw new HttpsError("invalid-argument", "URL must be http(s)");
-  }
+  const rawType = String(request.data?.sourceType ?? request.data?.kind ?? "m3u").toLowerCase();
+  const sourceType = rawType === "xtream" ? "xtream" : "m3u";
 
-  try {
-    const count = await countUserSources(uid);
-    if (count >= LIMITS.MAX_SOURCES_PER_USER) {
-      throw new HttpsError("resource-exhausted", "Source limit reached");
-    }
-
-    let urlEnc: ReturnType<typeof encryptUtf8>;
+  const encryptPayload = (plain: string, labelErr: string) => {
     try {
-      urlEnc = encryptUtf8(url);
+      return encryptUtf8(plain);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const inEmu = process.env.FUNCTIONS_EMULATOR === "true";
@@ -103,34 +93,118 @@ export const upsertSource = onCall({ ...RUN_INVOKER_PUBLIC, secrets: [encryption
       throw new HttpsError(
         "failed-precondition",
         inEmu
-          ? "Could not encrypt the source URL. Check the Functions emulator logs and ENCRYPTION_KEY in functions/.env."
-          : "Could not encrypt the source URL. Check Cloud Functions logs and the IPTV_ENCRYPTION_KEY secret.",
+          ? `Could not encrypt ${labelErr}. Check the Functions emulator logs and ENCRYPTION_KEY in functions/.env.`
+          : `Could not encrypt ${labelErr}. Check Cloud Functions logs and the IPTV_ENCRYPTION_KEY secret.`,
       );
     }
+  };
 
+  try {
     const id = String(request.data?.id ?? "");
+    if (!id) {
+      const count = await countUserSources(uid);
+      if (count >= LIMITS.MAX_SOURCES_PER_USER) {
+        throw new HttpsError("resource-exhausted", "Source limit reached");
+      }
+    }
+
+    let editSnap: DocumentSnapshot | null = null;
+    if (id) {
+      const ref = db.collection("sources").doc(id);
+      editSnap = await ref.get();
+      if (!editSnap.exists || (editSnap.data() as { ownerUid?: string }).ownerUid !== uid) {
+        throw new HttpsError("not-found", "Source not found");
+      }
+    }
+
+    let payload: Record<string, unknown>;
+
+    if (sourceType === "m3u") {
+      const url = String(request.data?.url ?? "").trim();
+      if (!url || url.length > LIMITS.MAX_SOURCE_URL_LENGTH) {
+        throw new HttpsError("invalid-argument", "Invalid source URL");
+      }
+      if (!(url.startsWith("http://") || url.startsWith("https://"))) {
+        throw new HttpsError("invalid-argument", "URL must be http(s)");
+      }
+      const urlEnc = encryptPayload(url, "the source URL");
+      payload = {
+        label: label || "Source",
+        kind: FieldValue.delete(),
+        urlEnc,
+        xtreamEnc: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+    } else {
+      let baseUrl = String(request.data?.xtreamBaseUrl ?? "").trim();
+      const username = String(request.data?.xtreamUsername ?? "").trim();
+      let password = String(request.data?.xtreamPassword ?? "");
+      if (baseUrl.length > LIMITS.MAX_XTREAM_BASE_URL_LENGTH) {
+        throw new HttpsError("invalid-argument", "Xtream base URL is too long");
+      }
+      if (!username || username.length > LIMITS.MAX_XTREAM_USERNAME_LENGTH) {
+        throw new HttpsError("invalid-argument", "Invalid Xtream username");
+      }
+      if (password.length > LIMITS.MAX_XTREAM_PASSWORD_LENGTH) {
+        throw new HttpsError("invalid-argument", "Xtream password is too long");
+      }
+      try {
+        baseUrl = normalizeXtreamBaseUrl(baseUrl);
+      } catch (e) {
+        const m = e instanceof Error ? e.message : "Invalid Xtream base URL";
+        throw new HttpsError("invalid-argument", m);
+      }
+      if (editSnap) {
+        const prev = editSnap.data() as { kind?: string; xtreamEnc?: { iv: string; tag: string; data: string } };
+        if ((!password || password === "") && prev.kind === "xtream" && prev.xtreamEnc) {
+          try {
+            const old = JSON.parse(decryptUtf8(prev.xtreamEnc)) as { password?: string };
+            if (typeof old.password === "string" && old.password.length > 0) password = old.password;
+          } catch {
+            /* fall through to empty check */
+          }
+        }
+      }
+      if (!password) {
+        throw new HttpsError("invalid-argument", "Xtream password is required for a new source (or when changing it)");
+      }
+      const xtreamJson = JSON.stringify({ baseUrl, username, password });
+      const xtreamEnc = encryptPayload(xtreamJson, "Xtream credentials");
+      payload = {
+        label: label || "Xtream source",
+        kind: "xtream",
+        xtreamEnc,
+        urlEnc: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+    }
+
     try {
       if (id) {
-        const ref = db.collection("sources").doc(id);
-        const snap = await ref.get();
-        if (!snap.exists || (snap.data() as { ownerUid?: string }).ownerUid !== uid) {
-          throw new HttpsError("not-found", "Source not found");
-        }
-        await ref.update({
-          label,
-          urlEnc,
-          updatedAt: FieldValue.serverTimestamp(),
-        });
+        await db.collection("sources").doc(id).update(payload);
         return { id };
       }
 
+      /** `set()` must not include `FieldValue.delete()` — only `update()` supports delete sentinels. */
       const ref = db.collection("sources").doc();
-      await ref.set({
-        ownerUid: uid,
-        label: label || "Source",
-        urlEnc,
-        createdAt: FieldValue.serverTimestamp(),
-      });
+      if (sourceType === "m3u") {
+        const urlEnc = payload.urlEnc as ReturnType<typeof encryptUtf8>;
+        await ref.set({
+          ownerUid: uid,
+          label: payload.label as string,
+          urlEnc,
+          createdAt: FieldValue.serverTimestamp(),
+        });
+      } else {
+        const xtreamEnc = payload.xtreamEnc as ReturnType<typeof encryptUtf8>;
+        await ref.set({
+          ownerUid: uid,
+          label: payload.label as string,
+          kind: "xtream",
+          xtreamEnc,
+          createdAt: FieldValue.serverTimestamp(),
+        });
+      }
       return { id: ref.id };
     } catch (e) {
       if (e instanceof HttpsError) throw e;

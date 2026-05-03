@@ -28,6 +28,18 @@ export const LIMITS = {
   MAX_CHANNELS_PER_PLAYLIST: 35_000,
   MAX_M3U_BYTES: 45 * 1024 * 1024,
   MAX_SOURCE_URL_LENGTH: 4096,
+  /** Xtream panel base URL (scheme + host + optional port only, normalized server-side). */
+  MAX_XTREAM_BASE_URL_LENGTH: 512,
+  MAX_XTREAM_USERNAME_LENGTH: 256,
+  MAX_XTREAM_PASSWORD_LENGTH: 256,
+  /** Per `player_api.php` HTTP call (categories / streams). */
+  XTREAM_HTTP_TIMEOUT_MS: 120_000,
+  /** Max JSON body per Xtream API response (live/VOD list payloads). */
+  XTREAM_MAX_API_RESPONSE_BYTES: 45 * 1024 * 1024,
+  /** Max category round-trips when the panel does not return a single combined `get_live_streams` list. */
+  XTREAM_MAX_CATEGORY_FETCHES: 250,
+  /** Pause between Xtream category fetches to reduce rate limits. */
+  XTREAM_REQUEST_GAP_MS: 120,
   MAX_LABEL_LENGTH: 120,
   MAX_PLAYLIST_NAME_LENGTH: 80,
   /** Max concurrent TMDB lookups per refresh (Milestone B). */

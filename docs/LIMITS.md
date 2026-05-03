@@ -10,6 +10,13 @@ These limits match the **IPTV Middleware MVP** product requirement: *hard caps s
 | `MAX_CHANNELS_PER_PLAYLIST` | 35,000 | Parse memory / job time |
 | `MAX_M3U_BYTES` | 45 MiB | Single upstream or output body |
 | `MAX_SOURCE_URL_LENGTH` | 4,096 | Source URL field |
+| `MAX_XTREAM_BASE_URL_LENGTH` | 512 | Xtream panel base URL (http(s) + host + optional port) |
+| `MAX_XTREAM_USERNAME_LENGTH` | 256 | Xtream username |
+| `MAX_XTREAM_PASSWORD_LENGTH` | 256 | Xtream password |
+| `XTREAM_HTTP_TIMEOUT_MS` | 120,000 ms | Per `player_api.php` request in `xtream.ts` |
+| `XTREAM_MAX_API_RESPONSE_BYTES` | 45 MiB | Max JSON body per Xtream API response |
+| `XTREAM_MAX_CATEGORY_FETCHES` | 250 | Category round-trips when bulk `get_live_streams` is empty |
+| `XTREAM_REQUEST_GAP_MS` | 120 ms | Pause between category fetches |
 | `MAX_LABEL_LENGTH` | 120 | Source label |
 | `MAX_PLAYLIST_NAME_LENGTH` | 80 | Playlist name |
 | `TMDB_CONCURRENCY` | 4 | Parallel TMDB HTTP calls per refresh |
@@ -22,12 +29,14 @@ These limits match the **IPTV Middleware MVP** product requirement: *hard caps s
 - **Scheduled batch:** at most **15** playlists per scheduler run (`limit(15)` query).
 - **Manual refresh:** same `runPlaylistRefresh` path as scheduled.
 - **Upstream fetch:** retries on transient HTTP/network errors; alternate **browser-like User-Agent** if the first profile fails; response must look like **M3U** (`#EXTM3U`), not HTML (captures wrong URLs / captive portals). Non-standard HTTP status codes are accepted **only if** the body still validates as M3U (some IPTV panels use custom codes such as 884 with a valid playlist).
+- **Xtream Codes:** `player_api.php` is used to pull categories and streams; the Functions build an **M3U** in memory (same merge/rules path as URL sources). Live TV is fetched first (bulk `get_live_streams` when the panel returns a list, else per-category); then **VOD** up to the global channel cap. **Series** are not expanded (different API shape).
 
 ## Enforcement locations
 
 - `functions/src/constants.ts` — canonical `LIMITS` object.
 - `functions/src/index.ts` — `countUserSources` / `countUserPlaylists`, URL length, `createPlaylist` source checks.
 - `functions/src/refresh.ts` — `assertLimits`, M3U byte cap after merge, upstream `fetchM3u` timeout / retries.
+- `functions/src/xtream.ts` — Xtream HTTP caps, category fan-out, generated M3U size.
 
 ## TMDB
 

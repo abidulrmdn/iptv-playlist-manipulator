@@ -3,6 +3,7 @@ import { gunzipSync, inflateSync } from "node:zlib";
 import { FieldValue, Timestamp, type Firestore } from "firebase-admin/firestore";
 import type { Bucket } from "@google-cloud/storage";
 import { decryptUtf8, type EncPayload } from "./crypto.js";
+import { fetchXtreamM3uText } from "./xtream.js";
 import { LIMITS, type PlaylistRules } from "./constants.js";
 import { applyRules, mergePlaylistRules } from "./rules.js";
 import { canonicalId, parseM3u, serializeM3u, type ChannelEntry } from "./m3u.js";
@@ -11,7 +12,11 @@ import { enrichWithTmdb } from "./enrich.js";
 export type SourceDoc = {
   ownerUid: string;
   label: string;
-  urlEnc: EncPayload;
+  /** Legacy M3U URL source; omit when `kind` is `xtream`. */
+  urlEnc?: EncPayload;
+  /** `xtream` = credentials for `player_api.php`; server builds M3U on refresh. */
+  kind?: "m3u" | "xtream";
+  xtreamEnc?: EncPayload;
   createdAt: Timestamp;
 };
 
@@ -464,8 +469,19 @@ export async function runPlaylistRefresh(params: {
     if (!sSnap.exists) continue;
     const s = sSnap.data() as SourceDoc;
     if (s.ownerUid !== ownerUid) continue;
-    const url = decryptUtf8(s.urlEnc);
-    const text = await fetchM3u(url);
+    let text: string;
+    if (s.kind === "xtream") {
+      if (!s.xtreamEnc) {
+        throw new Error("Xtream source is missing stored credentials; remove it and add it again.");
+      }
+      const plain = decryptUtf8(s.xtreamEnc);
+      const cfg = JSON.parse(plain) as { baseUrl: string; username: string; password: string };
+      text = await fetchXtreamM3uText(cfg);
+    } else {
+      if (!s.urlEnc) continue;
+      const url = decryptUtf8(s.urlEnc);
+      text = await fetchM3u(url);
+    }
     merged.push(...parseM3u(text));
   }
 

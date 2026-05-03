@@ -43,5 +43,5 @@ Prefix: `users/{ownerUid}/playlists/{playlistId}/`
 
 ## Out of scope for casual changes
 
-- Xtream Codes API.
+- Xtream **series** expansion (episodes) — live + VOD M3U generation only in `xtream.ts`.
 - Per-channel REST PATCH unless explicitly specced; organizer + Firestore rules + callables are the current triage surface.

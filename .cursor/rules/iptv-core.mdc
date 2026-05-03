@@ -9,4 +9,4 @@ alwaysApply: true
 - **Cost (mandatory):** Changes that raise baseline spend need justification. **Enforce** caps via `LIMITS` in `functions/src/constants.ts` and document in `docs/LIMITS.md`. Prefer Storage blobs + aggregate Firestore docs over per-channel documents at scale.
 - **Security:** Provider URLs and sensitive headers are **encrypted at rest** (`functions/src/crypto.ts`). Do **not** log plaintext URLs, tokens, or decrypt output in errors.
 - **Phasing:** Treat milestones **A → B → C** as the mental model (core pipeline → TMDB → snapshots/diff/NEW). Avoid scope creep in a single PR.
-- **Deferred (explicit):** Xtream Codes API; per-channel `PATCH …/channels/:id` REST (organizer + rules cover v1 triage).
+- **Deferred (explicit):** Xtream **series** (episode) expansion; per-channel `PATCH …/channels/:id` REST (organizer + rules cover v1 triage). Xtream live+VOD → generated M3U is supported (`functions/src/xtream.ts`).

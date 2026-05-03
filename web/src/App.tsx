@@ -82,7 +82,7 @@ function clientErrorMessage(e: unknown): string {
   return "Something went wrong";
 }
 
-type SourceRow = { id: string; label: string; createdAt?: { seconds?: number } };
+type SourceRow = { id: string; label: string; kind: "m3u" | "xtream"; createdAt?: { seconds?: number } };
 type PlaylistRow = {
   id: string;
   name: string;
@@ -142,7 +142,11 @@ export function App() {
   const [playlists, setPlaylists] = useState<PlaylistRow[]>([]);
 
   const [srcLabel, setSrcLabel] = useState("");
+  const [srcKind, setSrcKind] = useState<"m3u" | "xtream">("m3u");
   const [srcUrl, setSrcUrl] = useState("");
+  const [xtBase, setXtBase] = useState("");
+  const [xtUser, setXtUser] = useState("");
+  const [xtPass, setXtPass] = useState("");
 
   const [plName, setPlName] = useState("My playlist");
   const [plSources, setPlSources] = useState<string[]>([]);
@@ -265,8 +269,14 @@ export function App() {
       (snap) => {
         setSources(
           snap.docs.map((d) => {
-            const x = d.data() as { label?: string };
-            return { id: d.id, label: x.label ?? "", createdAt: (d.data() as { createdAt?: { seconds?: number } }).createdAt };
+            const x = d.data() as { label?: string; kind?: string };
+            const kind = x.kind === "xtream" ? "xtream" : "m3u";
+            return {
+              id: d.id,
+              label: x.label ?? "",
+              kind,
+              createdAt: (d.data() as { createdAt?: { seconds?: number } }).createdAt,
+            };
           }),
         );
       },
@@ -390,15 +400,52 @@ export function App() {
       if (!u) throw new Error("You are not signed in (or the session expired). Refresh the page and sign in again.");
       await u.getIdToken();
       const label = srcLabel.trim() || "Source";
-      const url = srcUrl.trim();
-      const upsert = callable<{ label: string; url: string }, { id: string }>("upsertSource");
-      const { data } = await upsert({ label, url });
-      setSrcUrl("");
+      const upsert = callable<
+        {
+          label: string;
+          sourceType?: string;
+          url?: string;
+          xtreamBaseUrl?: string;
+          xtreamUsername?: string;
+          xtreamPassword?: string;
+        },
+        { id: string }
+      >("upsertSource");
+      let kind: SourceRow["kind"] = "m3u";
+      let data: { id: string };
+      if (srcKind === "m3u") {
+        const url = srcUrl.trim();
+        if (!url) throw new Error("Enter a playlist URL");
+        const r = await upsert({ label, sourceType: "m3u", url });
+        data = r.data;
+        setSrcUrl("");
+        kind = "m3u";
+      } else {
+        if (!xtBase.trim()) throw new Error("Enter the Xtream server URL (e.g. http://panel.example:8080)");
+        if (!xtUser.trim()) throw new Error("Enter the Xtream username");
+        if (!xtPass.trim()) throw new Error("Enter the Xtream password");
+        const r = await upsert({
+          label,
+          sourceType: "xtream",
+          xtreamBaseUrl: xtBase.trim(),
+          xtreamUsername: xtUser.trim(),
+          xtreamPassword: xtPass,
+        });
+        data = r.data;
+        setXtBase("");
+        setXtUser("");
+        setXtPass("");
+        kind = "xtream";
+      }
       setSources((prev) => {
         if (prev.some((s) => s.id === data.id)) return prev;
-        return [{ id: data.id, label, createdAt: { seconds: Math.floor(Date.now() / 1000) } }, ...prev];
+        return [{ id: data.id, label, kind, createdAt: { seconds: Math.floor(Date.now() / 1000) } }, ...prev];
       });
-      notify("Source added (URL encrypted server-side)");
+      notify(
+        kind === "xtream"
+          ? "Xtream source added (credentials encrypted server-side; refresh builds M3U from the API)"
+          : "Source added (URL encrypted server-side)",
+      );
     });
 
   const removeSource = (id: string) =>
@@ -897,11 +944,34 @@ export function App() {
         <div className="grid gap-6 lg:grid-cols-2 lg:gap-8">
           <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 sm:p-6">
             <p className="text-xs font-medium uppercase tracking-wide text-emerald-600/90">Step 1 · Inputs</p>
-            <h2 className="font-display mt-1 text-lg font-semibold text-white sm:text-xl">Your source M3U URLs</h2>
+            <h2 className="font-display mt-1 text-lg font-semibold text-white sm:text-xl">Your sources</h2>
             <p className="mt-2 text-sm text-zinc-400">
-              Each entry is one <strong className="font-medium text-zinc-300">original</strong> playlist URL from a
-              provider. URLs are encrypted on the server and never shown back in full.
+              Add either an <strong className="font-medium text-zinc-300">M3U URL</strong> or{" "}
+              <strong className="font-medium text-zinc-300">Xtream Codes</strong> (server URL + login). Secrets stay on
+              the server (encrypted); refresh downloads or builds M3U on Firebase, then merges like any other source.
             </p>
+            <div className="mt-4 flex flex-wrap gap-4 text-sm">
+              <label className="inline-flex cursor-pointer items-center gap-2 text-zinc-300">
+                <input
+                  type="radio"
+                  name="srcKind"
+                  className="accent-emerald-500"
+                  checked={srcKind === "m3u"}
+                  onChange={() => setSrcKind("m3u")}
+                />
+                M3U URL
+              </label>
+              <label className="inline-flex cursor-pointer items-center gap-2 text-zinc-300">
+                <input
+                  type="radio"
+                  name="srcKind"
+                  className="accent-emerald-500"
+                  checked={srcKind === "xtream"}
+                  onChange={() => setSrcKind("xtream")}
+                />
+                Xtream Codes
+              </label>
+            </div>
             <div className="mt-4 space-y-3">
               <input
                 placeholder="Label (e.g. Provider A)"
@@ -909,15 +979,49 @@ export function App() {
                 value={srcLabel}
                 onChange={(e) => setSrcLabel(e.target.value)}
               />
-              <input
-                placeholder="https://…/playlist.m3u"
-                className="min-h-11 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm sm:min-h-0 sm:py-2"
-                value={srcUrl}
-                onChange={(e) => setSrcUrl(e.target.value)}
-              />
+              {srcKind === "m3u" ? (
+                <input
+                  placeholder="https://…/playlist.m3u"
+                  className="min-h-11 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm sm:min-h-0 sm:py-2"
+                  value={srcUrl}
+                  onChange={(e) => setSrcUrl(e.target.value)}
+                />
+              ) : (
+                <>
+                  <input
+                    placeholder="Server URL (e.g. http://panel.example.com or http://host:8080)"
+                    className="min-h-11 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm sm:min-h-0 sm:py-2"
+                    value={xtBase}
+                    onChange={(e) => setXtBase(e.target.value)}
+                    autoComplete="off"
+                  />
+                  <input
+                    placeholder="Username"
+                    className="min-h-11 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm sm:min-h-0 sm:py-2"
+                    value={xtUser}
+                    onChange={(e) => setXtUser(e.target.value)}
+                    autoComplete="off"
+                  />
+                  <input
+                    placeholder="Password"
+                    type="password"
+                    className="min-h-11 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm sm:min-h-0 sm:py-2"
+                    value={xtPass}
+                    onChange={(e) => setXtPass(e.target.value)}
+                    autoComplete="new-password"
+                  />
+                  <p className="text-xs text-zinc-500">
+                    Use the same host you would put in an IPTV app for Xtream API (not the long M3U link). Live + VOD
+                    are included; series are not.
+                  </p>
+                </>
+              )}
               <button
                 type="button"
-                disabled={busy || !srcUrl.trim()}
+                disabled={
+                  busy ||
+                  (srcKind === "m3u" ? !srcUrl.trim() : !xtBase.trim() || !xtUser.trim() || !xtPass.trim())
+                }
                 onClick={addSource}
                 className="min-h-11 w-full rounded-lg bg-emerald-500 py-3 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-40 sm:py-2"
               >
@@ -928,7 +1032,14 @@ export function App() {
             <ul className="mt-4 divide-y divide-zinc-800 rounded-xl border border-zinc-800">
               {sources.map((s) => (
                 <li key={s.id} className="flex items-center justify-between gap-3 px-3 py-3 text-sm">
-                  <span className="min-w-0 flex-1 truncate text-zinc-200">{s.label}</span>
+                  <span className="min-w-0 flex-1 truncate text-zinc-200">
+                    {s.kind === "xtream" && (
+                      <span className="mr-2 rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-300">
+                        Xtream
+                      </span>
+                    )}
+                    {s.label}
+                  </span>
                   <button
                     type="button"
                     className="min-h-10 shrink-0 rounded-md px-3 py-2 text-xs text-red-400 hover:bg-red-500/10 hover:text-red-300 sm:py-1"
