@@ -383,8 +383,6 @@ export function PlaylistOrganizer() {
     series: number;
   } | null>(null);
   const editorFetchGen = useRef(0);
-  /** When true, first page loads but further pages are not auto-fetched (e.g. after refreshPlaylist). */
-  const suppressEditorAutoHydrateRef = useRef(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
   const [menu, setMenu] = useState<ContextMenuState | null>(null);
@@ -469,109 +467,69 @@ export function PlaylistOrganizer() {
     return () => window.clearTimeout(t);
   }, [q, serverQuery]);
 
-  const load = useCallback(
-    async (reset: boolean) => {
-      if (!playlistId || !user) return;
-      if (reset) {
-        loadedThroughRef.current = 0;
-        editorFetchGen.current += 1;
-        setBusy(true);
-      }
-      const session = editorFetchGen.current;
-      let d:
-        | {
-            name: string;
-            publicToken: string;
-            rules: PlaylistRules;
-            channels: EditorRow[];
-            total: number;
-            offset: number;
-            limit: number;
-            hasMore: boolean;
-            enrichEnabled: boolean;
-            duplicateNewIntoLatest: boolean;
-            dataSet?: string;
-            rulesDroppedAvailable?: boolean;
-            totalsByTab?: { all: number; tv: number; movie: number; series: number };
-          }
-        | null = null;
-      try {
-        if (reset) rulesSaveGeneration.current += 1;
-        const off = reset ? 0 : loadedThroughRef.current;
-        const fn = callable<
-          {
-            playlistId: string;
-            offset?: number;
-            limit?: number;
-            dataSet?: string;
-            search?: string;
-            tab?: string;
-          },
-          {
-            name: string;
-            publicToken: string;
-            rules: PlaylistRules;
-            channels: EditorRow[];
-            total: number;
-            offset: number;
-            limit: number;
-            hasMore: boolean;
-            enrichEnabled: boolean;
-            duplicateNewIntoLatest: boolean;
-            dataSet?: string;
-            rulesDroppedAvailable?: boolean;
-            totalsByTab?: { all: number; tv: number; movie: number; series: number };
-          }
-        >("getPlaylistEditorData", { timeout: 120_000 });
-        const r = await fn({
-          playlistId,
-          offset: off,
-          limit: LIMITS.MAX_EDITOR_PAGE_SIZE,
-          dataSet: editorDataSet === "rulesDropped" ? "rulesDropped" : "player",
-          ...(serverQuery ? { search: serverQuery } : {}),
-          ...(tab !== "all" ? { tab } : {}),
-        });
-        if (session !== editorFetchGen.current) return;
-        d = r.data;
-        skipNextRulesAutosave.current = true;
-        setName(d.name);
-        setPublicToken(d.publicToken ?? "");
-        setRules(d.rules);
-        setEnrichEnabled(Boolean(d.enrichEnabled));
-        setDupLatest(d.duplicateNewIntoLatest !== false);
-        setTotal(d.total);
-        setHasMore(d.hasMore);
-        if (d.totalsByTab) setTotalsByTab(d.totalsByTab);
-        loadedThroughRef.current = d.offset + d.channels.length;
-        startTransition(() => {
-          setRows((prev) => {
-            if (reset) return d!.channels;
-            const seen = new Set(prev.map((x) => x.id));
-            const add = d!.channels.filter((c) => !seen.has(c.id));
-            return [...prev, ...add];
-          });
-        });
-      } catch (e) {
-        notify(errMsg(e));
-      } finally {
-        if (reset && session === editorFetchGen.current) setBusy(false);
-      }
-      if (
-        !d ||
-        !d.hasMore ||
-        session !== editorFetchGen.current ||
-        suppressEditorAutoHydrateRef.current
-      ) {
-        return;
-      }
-      await new Promise<void>((resolve) => {
-        requestAnimationFrame(() => resolve());
+  /** Fetches one page from offset 0 for the current tab/search/source, then shows it (no silent background paging). */
+  const load = useCallback(async () => {
+    if (!playlistId || !user) return;
+    loadedThroughRef.current = 0;
+    editorFetchGen.current += 1;
+    const session = editorFetchGen.current;
+    setBusy(true);
+    try {
+      rulesSaveGeneration.current += 1;
+      const fn = callable<
+        {
+          playlistId: string;
+          offset?: number;
+          limit?: number;
+          dataSet?: string;
+          search?: string;
+          tab?: string;
+        },
+        {
+          name: string;
+          publicToken: string;
+          rules: PlaylistRules;
+          channels: EditorRow[];
+          total: number;
+          offset: number;
+          limit: number;
+          hasMore: boolean;
+          enrichEnabled: boolean;
+          duplicateNewIntoLatest: boolean;
+          dataSet?: string;
+          rulesDroppedAvailable?: boolean;
+          totalsByTab?: { all: number; tv: number; movie: number; series: number };
+        }
+      >("getPlaylistEditorData", { timeout: 120_000 });
+      const r = await fn({
+        playlistId,
+        offset: 0,
+        limit: LIMITS.MAX_EDITOR_PAGE_SIZE,
+        dataSet: editorDataSet === "rulesDropped" ? "rulesDropped" : "player",
+        ...(serverQuery ? { search: serverQuery } : {}),
+        ...(tab !== "all" ? { tab } : {}),
       });
-      if (session !== editorFetchGen.current || suppressEditorAutoHydrateRef.current) return;
-      await load(false);
-    },
-    [playlistId, user, notify, editorDataSet, serverQuery, tab],
-  );
+      if (session !== editorFetchGen.current) return;
+      const d = r.data;
+      skipNextRulesAutosave.current = true;
+      setName(d.name);
+      setPublicToken(d.publicToken ?? "");
+      setRules(d.rules);
+      setEnrichEnabled(Boolean(d.enrichEnabled));
+      setDupLatest(d.duplicateNewIntoLatest !== false);
+      setTotal(d.total);
+      setHasMore(d.hasMore);
+      if (d.totalsByTab) setTotalsByTab(d.totalsByTab);
+      loadedThroughRef.current = d.offset + d.channels.length;
+      startTransition(() => {
+        setRows(d.channels);
+      });
+    } catch (e) {
+      notify(errMsg(e));
+    } finally {
+      if (session === editorFetchGen.current) setBusy(false);
+    }
+  }, [playlistId, user, notify, editorDataSet, serverQuery, tab]);
 
   /** Fetches every remaining page from the current offset until the server reports no more rows. */
   const loadAllRemaining = useCallback(async () => {
@@ -667,7 +625,7 @@ export function PlaylistOrganizer() {
   }, [playlistId, user, notify, editorDataSet, serverQuery, tab]);
 
   useEffect(() => {
-    if (user && playlistId) void load(true);
+    if (user && playlistId) void load();
   }, [user, playlistId, load]);
 
   const { tableSourceRows, excludedCount } = useMemo(() => {
@@ -817,13 +775,41 @@ export function PlaylistOrganizer() {
   }, [menu, rules, notify]);
 
   const moveChannelToTopFromMenu = useCallback(() => {
-    if (!menu || !rules) return;
-    const id = menu.row.id;
-    const merged = capChannelOrderList([id, ...(rules.channelOrder ?? []).filter((x) => x !== id)]);
+    if (!menu || !rules || menu.scope !== "channel") return;
+    const multi = selected.size > 1 && selected.has(menu.row.id);
+    let headIds: string[];
+    if (multi) {
+      const seen = new Set<string>();
+      const ordered: string[] = [];
+      for (const { rows: gr } of groupedVisible) {
+        for (const row of gr) {
+          if (selected.has(row.id) && !seen.has(row.id)) {
+            seen.add(row.id);
+            ordered.push(row.id);
+          }
+        }
+      }
+      for (const id of selected) {
+        if (!seen.has(id)) {
+          seen.add(id);
+          ordered.push(id);
+        }
+      }
+      headIds = ordered;
+    } else {
+      headIds = [menu.row.id];
+    }
+    const headSet = new Set(headIds);
+    const rest = (rules.channelOrder ?? []).filter((x) => !headSet.has(x));
+    const merged = capChannelOrderList([...headIds, ...rest]);
     setRules({ ...rules, channelOrder: merged });
     setMenu(null);
-    notify("Channel moved to top of its group — refresh the player file when you want the hosted M3U to match.");
-  }, [menu, rules, notify]);
+    notify(
+      multi
+        ? `Moved ${headIds.length.toLocaleString()} channels to the top of each group — refresh the player file when you want the hosted M3U to match.`
+        : "Channel moved to top of its group — refresh the player file when you want the hosted M3U to match.",
+    );
+  }, [menu, rules, notify, selected, groupedVisible]);
 
   const toggleGroupRows = (gRows: EditorRow[]) => {
     const ids = gRows.map((r) => r.id);
@@ -878,12 +864,7 @@ export function PlaylistOrganizer() {
       });
       await fn({ playlistId });
       notify("Player file updated — reloading this table from the server…");
-      suppressEditorAutoHydrateRef.current = true;
-      try {
-        await load(true);
-      } finally {
-        suppressEditorAutoHydrateRef.current = false;
-      }
+      await load();
     } catch (e) {
       notify(errMsg(e));
     } finally {
@@ -1189,6 +1170,10 @@ export function PlaylistOrganizer() {
     return <p className="p-8 text-zinc-400">Missing playlist id.</p>;
   }
 
+  const menuIsMultiChannel = Boolean(
+    menu && menu.scope === "channel" && selected.size > 1 && selected.has(menu.row.id),
+  );
+
   if (!user) {
     return (
       <div className="flex min-h-[100dvh] items-center justify-center bg-zinc-950 px-4 py-8">
@@ -1299,7 +1284,7 @@ export function PlaylistOrganizer() {
                 <button
                   type="button"
                   disabled={busy}
-                  onClick={() => void load(true)}
+                  onClick={() => void load()}
                   title="Discards unsaved-in-memory table state: re-downloads the current list from Firebase for this data source (player file or hidden-by-rules), reapplies your saved rules metadata, and resets pagination to the first page."
                   className="min-w-0 flex-1 rounded-lg border border-zinc-600 px-2 py-2.5 text-sm leading-snug hover:bg-zinc-800 disabled:opacity-40"
                 >
@@ -1342,9 +1327,6 @@ export function PlaylistOrganizer() {
           <span className="ml-auto text-xs text-zinc-500">
             Loaded {rows.length.toLocaleString()} / {total.toLocaleString()}{" "}
             {editorDataSet === "rulesDropped" ? "hidden rows" : "rows"}
-            {!busy && hasMore && rows.length < total ? (
-              <span className="text-sky-400/90"> · loading more in the background…</span>
-            ) : null}
             {editorDataSet === "player" && excludedCount > 0 && !showExcluded ? ` · ${excludedCount} hidden by rules (preview)` : ""}
             {editorDataSet === "player" && showExcluded ? " · showing rules preview (excluded only)" : ""}
             {editorDataSet === "rulesDropped" ? " · last refresh snapshot" : ""}
@@ -1552,7 +1534,7 @@ export function PlaylistOrganizer() {
                       Load all channels
                     </button>
                     <span className="max-w-xs text-right text-[10px] text-zinc-500">
-                      The table usually fills automatically; this pulls the rest in one go with the same search and tab filter.
+                      Fetches each page from the server and appends rows until everything for this search and tab is shown.
                     </span>
                   </div>
                 ) : null}
@@ -1699,17 +1681,21 @@ export function PlaylistOrganizer() {
             className="fixed z-40 min-w-[200px] rounded-lg border border-zinc-700 bg-zinc-900 py-1 shadow-xl"
             style={{ left: menu.x, top: menu.y }}
           >
-            <p className="border-b border-zinc-800 px-3 py-1.5 text-xs text-zinc-500">Filter like this</p>
-            <button type="button" className="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-800" onClick={() => openFilterLike(menu.row, "name")}>
-              By channel title…
-            </button>
-            <button type="button" className="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-800" onClick={() => openFilterLike(menu.row, "group")}>
-              By group name…
-            </button>
-            <button type="button" className="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-800" onClick={() => openFilterLike(menu.row, "url")}>
-              By stream URL…
-            </button>
-            <div className="my-1 border-t border-zinc-800" />
+            {!menuIsMultiChannel ? (
+              <>
+                <p className="border-b border-zinc-800 px-3 py-1.5 text-xs text-zinc-500">Filter like this</p>
+                <button type="button" className="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-800" onClick={() => openFilterLike(menu.row, "name")}>
+                  By channel title…
+                </button>
+                <button type="button" className="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-800" onClick={() => openFilterLike(menu.row, "group")}>
+                  By group name…
+                </button>
+                <button type="button" className="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-800" onClick={() => openFilterLike(menu.row, "url")}>
+                  By stream URL…
+                </button>
+                <div className="my-1 border-t border-zinc-800" />
+              </>
+            ) : null}
             <p className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Order</p>
             {menu.scope === "group" ? (
               <button
@@ -1727,7 +1713,9 @@ export function PlaylistOrganizer() {
                 disabled={!rules}
                 onClick={() => moveChannelToTopFromMenu()}
               >
-                Move channel to top of group
+                {menuIsMultiChannel
+                  ? `Move ${selected.size.toLocaleString()} channels to top of each group`
+                  : "Move channel to top of group"}
               </button>
             )}
           </div>
