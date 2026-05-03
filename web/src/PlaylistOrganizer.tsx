@@ -940,7 +940,8 @@ export function PlaylistOrganizer() {
     const scopeArr: RulePatternTabScope[] = [...rules[scopesKey]];
     while (scopeArr.length < arr.length) scopeArr.push("all");
     scopeArr.length = arr.length;
-    const scope: RulePatternTabScope = tab === "all" ? "all" : tab;
+    /** Include filters honor the category tab; excludes stay global so they match every channel on refresh. */
+    const scope: RulePatternTabScope = mode === "exclude" ? "all" : tab === "all" ? "all" : tab;
     if (!arr.includes(pattern)) {
       arr.push(pattern);
       scopeArr.push(scope);
@@ -948,9 +949,11 @@ export function PlaylistOrganizer() {
     setRules({ ...rules, [patternsKey]: arr, [scopesKey]: scopeArr });
     setFilterModal(null);
     notify(
-      tab === "all"
+      mode === "exclude"
         ? `Added ${mode} pattern on ${field}.`
-        : `Added ${mode} pattern on ${field} (applies only to ${tab === "tv" ? "TV" : tab === "movie" ? "Movies" : "Series"}).`,
+        : tab === "all"
+          ? `Added ${mode} pattern on ${field}.`
+          : `Added ${mode} pattern on ${field} (applies only to ${tab === "tv" ? "TV" : tab === "movie" ? "Movies" : "Series"}).`,
     );
   };
 

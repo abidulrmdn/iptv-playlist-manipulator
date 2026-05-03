@@ -73,6 +73,11 @@ export function mergePlaylistRules(raw: unknown): PlaylistRules {
     merged.channelOrder = merged.channelOrder.slice(0, LIMITS.MAX_CHANNEL_ORDER_ENTRIES);
   }
   normalizePatternScopes(merged);
+  /** Excludes are always global (tab-scoped excludes were a footgun vs `classifyEditorTab` on the full M3U). */
+  for (const k of ["excludeGroupPatternScopes", "excludeNamePatternScopes", "excludeUrlPatternScopes"] as const) {
+    const arr = merged[k];
+    for (let i = 0; i < arr.length; i++) (arr as RulePatternTabScope[])[i] = "all";
+  }
   return merged;
 }
 
