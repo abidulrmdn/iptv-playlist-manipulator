@@ -9,10 +9,17 @@ export type XtreamCredentialsJson = {
 };
 
 export type FetchXtreamM3uOpts = {
-  /** Called as rows are assembled (throttle in caller). `built` is rows for this Xtream source so far. */
+  /** Called as rows are assembled (throttle in caller). `built` is total Xtream rows emitted for this source (includes `skipEmitFirst` prefix already merged elsewhere on resume). */
   onProgress?: (info: { built: number; detail: string }) => void;
   /** Max rows for this Xtream pull (caller passes remaining room in merged playlist). */
   maxChannels?: number;
+  /** Skip emitting the first N catalog rows (resume); caller already merged those from a checkpoint. */
+  skipEmitFirst?: number;
+  /**
+   * Called when total emitted (including prior skip) crosses a checkpoint boundary.
+   * `channels` is the in-memory tail emitted in this invocation (same array as built incrementally).
+   */
+  onCheckpoint?: (info: { totalXtreamEmitted: number; channels: ChannelEntry[] }) => void | Promise<void>;
 };
 
 type XtreamServerInfo = {
@@ -120,6 +127,25 @@ async function xtreamFetchBuffer(url: string): Promise<{ status: number; buf: Bu
   }
 }
 
+/** Appended to error message (no secrets). Kept short for callable / toast limits. */
+function xtreamHttpStatusHint(status: number): string {
+  if (status === 451) {
+    return " — 451: panel/CDN blocked this server (often geo or datacenter IP). Firebase cannot reach that host from here. Workarounds: add an M3U URL hosted where your backend is allowed, use a small relay you control on a residential IP, or ask the provider to allowlist Google Cloud egress.";
+  }
+  if (status === 403 || status === 401) {
+    return " — Check username/password and whether the panel allows API access from this network.";
+  }
+  if (status === 433 || status === 434) {
+    return " — Some panels use this for IP or session restrictions.";
+  }
+  return "";
+}
+
+/** Do not retry these: repeating the same request will not help. */
+function xtreamHttpNoRetry(status: number): boolean {
+  return status === 451 || status === 401 || status === 403 || status === 404;
+}
+
 async function xtreamFetchJson(url: string): Promise<unknown> {
   let lastErr: Error | null = null;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -132,12 +158,22 @@ async function xtreamFetchJson(url: string): Promise<unknown> {
       }
       if (status < 200 || status >= 300) {
         const snippet = buf.toString("utf8").slice(0, 200).replace(/\s+/g, " ");
-        throw new Error(`Xtream HTTP ${String(status)} ${redactXtreamUrl(url)} body:${snippet}`);
+        const hint = xtreamHttpStatusHint(status);
+        const bodyPart = snippet.length > 0 ? ` body:${snippet}` : "";
+        const err = new Error(`Xtream HTTP ${String(status)} ${redactXtreamUrl(url)}${bodyPart}${hint}`) as Error & {
+          xtreamHttpStatus?: number;
+        };
+        err.xtreamHttpStatus = status;
+        throw err;
       }
       const text = buf.toString("utf8").trim();
       if (!text) throw new Error(`Xtream empty JSON body ${redactXtreamUrl(url)}`);
       return JSON.parse(text) as unknown;
     } catch (e) {
+      const httpSt = e instanceof Error ? (e as unknown as { xtreamHttpStatus?: number }).xtreamHttpStatus : undefined;
+      if (typeof httpSt === "number" && xtreamHttpNoRetry(httpSt)) {
+        throw e;
+      }
       lastErr = e instanceof Error ? e : new Error(String(e));
       if (attempt < 2) await sleep(250 * (attempt + 1));
     }
@@ -286,9 +322,35 @@ export async function fetchXtreamM3uText(
       : LIMITS.MAX_CHANNELS_PER_PLAYLIST;
   const max = Math.min(LIMITS.MAX_CHANNELS_PER_PLAYLIST, Math.max(0, rawMax));
   const channels: ChannelEntry[] = [];
+  let skipRemain = Math.max(0, Math.floor(opts?.skipEmitFirst ?? 0));
+  const skipBase = skipRemain;
+  let lastCheckpointTotal = skipBase;
+  let lastProgressReported = 0;
+
+  const totalEmitted = () => skipBase + channels.length;
 
   const report = (detail: string) => {
-    opts?.onProgress?.({ built: channels.length, detail });
+    opts?.onProgress?.({ built: totalEmitted(), detail });
+  };
+
+  const pushRow = async (entry: ChannelEntry): Promise<boolean> => {
+    if (channels.length >= max) return false;
+    if (skipRemain > 0) {
+      skipRemain--;
+      return true;
+    }
+    channels.push(entry);
+    const tot = totalEmitted();
+    if (tot - lastProgressReported >= 4000) {
+      lastProgressReported = tot;
+      report(`Xtream: ${tot.toLocaleString()} channels…`);
+    }
+    const cp = LIMITS.REFRESH_XTREAM_CHECKPOINT_CHANNELS;
+    if (cp > 0 && tot > 0 && tot % cp === 0 && tot > lastCheckpointTotal && opts?.onCheckpoint) {
+      lastCheckpointTotal = tot;
+      await opts.onCheckpoint({ totalXtreamEmitted: tot, channels });
+    }
+    return channels.length < max;
   };
 
   report("Xtream: loading categories…");
@@ -298,7 +360,6 @@ export async function fetchXtreamM3uText(
   const useBulkLive = bulkLive.length > 0;
   if (useBulkLive) {
     report("Xtream: loading live (bulk)…");
-    let lastReported = 0;
     for (const row of bulkLive) {
       if (channels.length >= max) break;
       const sid = streamIdFrom(row);
@@ -309,7 +370,7 @@ export async function fetchXtreamM3uText(
       const icon = row.stream_icon != null ? String(row.stream_icon) : "";
       const epg = row.epg_channel_id != null ? String(row.epg_channel_id) : "";
       const u = `${baseRoot}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${sid}.${liveExt}`;
-      channels.push({
+      const cont = await pushRow({
         duration: "-1",
         title: name,
         url: u,
@@ -319,12 +380,9 @@ export async function fetchXtreamM3uText(
         tvgLogo: icon || undefined,
         groupTitle,
       });
-      if (channels.length - lastReported >= 4000) {
-        lastReported = channels.length;
-        report(`Xtream: live ${channels.length.toLocaleString()} channels…`);
-      }
+      if (!cont) break;
     }
-    report(`Xtream: live done (${channels.length.toLocaleString()} rows)`);
+    report(`Xtream: live done (${totalEmitted().toLocaleString()} rows)`);
   } else {
     report("Xtream: loading live by category…");
     let liveCatRequests = 0;
@@ -343,7 +401,7 @@ export async function fetchXtreamM3uText(
         const icon = row.stream_icon != null ? String(row.stream_icon) : "";
         const epg = row.epg_channel_id != null ? String(row.epg_channel_id) : "";
         const u = `${baseRoot}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${sid}.${liveExt}`;
-        channels.push({
+        const cont = await pushRow({
           duration: "-1",
           title: name,
           url: u,
@@ -353,8 +411,9 @@ export async function fetchXtreamM3uText(
           tvgLogo: icon || undefined,
           groupTitle,
         });
+        if (!cont) break;
       }
-      report(`Xtream: live · ${groupTitle.slice(0, 80)}${groupTitle.length > 80 ? "…" : ""} (${channels.length.toLocaleString()} total)`);
+      report(`Xtream: live · ${groupTitle.slice(0, 80)}${groupTitle.length > 80 ? "…" : ""} (${totalEmitted().toLocaleString()} total)`);
     }
   }
 
@@ -377,7 +436,7 @@ export async function fetchXtreamM3uText(
         const icon = row.stream_icon != null ? String(row.stream_icon) : "";
         const ext = String(row.container_extension ?? "mp4").replace(/^\./, "") || "mp4";
         const u = `${baseRoot}/movie/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${sid}.${ext}`;
-        channels.push({
+        const cont = await pushRow({
           duration: "-1",
           title: name,
           url: u,
@@ -386,12 +445,13 @@ export async function fetchXtreamM3uText(
           tvgLogo: icon || undefined,
           groupTitle,
         });
+        if (!cont) break;
       }
-      report(`Xtream: VOD · ${cname.slice(0, 72)}${cname.length > 72 ? "…" : ""} (${channels.length.toLocaleString()} total)`);
+      report(`Xtream: VOD · ${cname.slice(0, 72)}${cname.length > 72 ? "…" : ""} (${totalEmitted().toLocaleString()} total)`);
     }
   }
 
-  if (channels.length === 0) {
+  if (channels.length === 0 && skipBase === 0) {
     throw new Error(
       "Xtream source returned no live or VOD streams (empty catalog or unsupported panel response).",
     );

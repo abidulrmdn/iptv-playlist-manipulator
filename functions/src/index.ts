@@ -21,7 +21,7 @@ import {
 import { buildExcludeNamePatternsFromTitles } from "./excludeNamePatternChunks.js";
 import { canonicalId, parseM3u } from "./m3u.js";
 import { mergePlaylistRules } from "./rules.js";
-import { runPlaylistRefresh } from "./refresh.js";
+import { recoverPartialPlaylistFromCheckpoint, runPlaylistRefresh } from "./refresh.js";
 import { normalizeXtreamBaseUrl } from "./xtream.js";
 
 for (const p of [path.join(process.cwd(), ".env"), path.join(process.cwd(), "functions", ".env")]) {
@@ -337,6 +337,7 @@ export const refreshPlaylist = onCall(
     const uid = request.auth!.uid;
     const playlistId = String(request.data?.playlistId ?? "");
     if (!playlistId) throw new HttpsError("invalid-argument", "Missing playlistId");
+    const resume = Boolean((request.data as { resume?: unknown })?.resume);
 
     const tmdb = process.env.TMDB_API_KEY?.trim();
     try {
@@ -346,15 +347,28 @@ export const refreshPlaylist = onCall(
         ownerUid: uid,
         playlistId,
         tmdbApiKey: tmdb || undefined,
+        resume,
       });
       return { ok: true, channelCount, etag };
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Refresh failed";
+      let lastError = msg;
+      try {
+        const note = await recoverPartialPlaylistFromCheckpoint({
+          db,
+          bucket,
+          ownerUid: uid,
+          playlistId,
+        });
+        if (note) lastError = `${msg}\n\n${note}`;
+      } catch (recErr) {
+        console.error("recoverPartialPlaylistFromCheckpoint", recErr);
+      }
       await db
         .collection("playlists")
         .doc(playlistId)
         .update({
-          lastError: msg,
+          lastError: lastError,
           refreshProgress: FieldValue.delete(),
           updatedAt: FieldValue.serverTimestamp(),
         })
@@ -801,18 +815,31 @@ export const scheduledPlaylistRefresh = onSchedule(
     for (const doc of snap.docs) {
       const d = doc.data() as { ownerUid?: string };
       if (!d.ownerUid) continue;
+      const ownerUid = d.ownerUid;
       try {
         await runPlaylistRefresh({
           db,
           bucket,
-          ownerUid: d.ownerUid,
+          ownerUid,
           playlistId: doc.id,
           tmdbApiKey: tmdb || undefined,
         });
       } catch {
+        let lastError = "Scheduled refresh failed";
+        try {
+          const note = await recoverPartialPlaylistFromCheckpoint({
+            db,
+            bucket,
+            ownerUid,
+            playlistId: doc.id,
+          });
+          if (note) lastError = `${lastError}\n\n${note}`;
+        } catch (recErr) {
+          console.error("recoverPartialPlaylistFromCheckpoint (scheduled)", recErr);
+        }
         await doc.ref
           .update({
-            lastError: "Scheduled refresh failed",
+            lastError,
             refreshProgress: FieldValue.delete(),
             updatedAt: FieldValue.serverTimestamp(),
           })

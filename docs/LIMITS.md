@@ -20,6 +20,8 @@ These limits match the **IPTV Middleware MVP** product requirement: *hard caps s
 | `XTREAM_MAX_STREAM_PAGES_PER_CATEGORY` | 40 | Max paginated stream pages per category |
 | `XTREAM_REQUEST_GAP_MS` | 120 ms | Pause between Xtream stream pages and category fetches |
 | `REFRESH_PROGRESS_MIN_MS` | 2,000 ms | Min interval between Firestore `refreshProgress` field updates during refresh |
+| `REFRESH_XTREAM_CHECKPOINT_CHANNELS` | 10,000 | Xtream refresh: emit a Storage checkpoint (`playlist.checkpoint-raw.m3u` + meta) every N emitted rows |
+| `REFRESH_CHECKPOINT_MAX_STORAGE_WRITES` | 40 | Max checkpoint uploads per refresh (cost cap) |
 | `MAX_LABEL_LENGTH` | 120 | Source label |
 | `MAX_PLAYLIST_NAME_LENGTH` | 80 | Playlist name |
 | `TMDB_CONCURRENCY` | 4 | Parallel TMDB HTTP calls per refresh |
@@ -37,7 +39,8 @@ These limits match the **IPTV Middleware MVP** product requirement: *hard caps s
 - **Manual refresh:** same `runPlaylistRefresh` path as scheduled.
 - **Upstream fetch:** retries on transient HTTP/network errors; alternate **browser-like User-Agent** if the first profile fails; response must look like **M3U** (`#EXTM3U`), not HTML (captures wrong URLs / captive portals). Non-standard HTTP status codes are accepted **only if** the body still validates as M3U (some IPTV panels use custom codes such as 884 with a valid playlist).
 - **Xtream Codes:** `player_api.php` is used to pull categories and streams; the Functions build an **M3U** in memory (same merge/rules path as URL sources). Live TV is fetched first (bulk `get_live_streams` when the panel returns a list, else **every** live category until the channel cap or `XTREAM_MAX_CATEGORY_REQUESTS`). If a single response contains exactly `XTREAM_PAGE_SIZE` streams, additional pages are requested with `offset`/`limit` until a short or duplicate page. **VOD** uses the same category + paging pattern. **Series** are not expanded (different API shape).
-- **Refresh progress:** While `runPlaylistRefresh` runs, the playlist document may include ephemeral `refreshProgress` (`phase`, `channelsSoFar`, `sourcesDone` / `sourcesTotal`, optional `detail`). The web app listens over Firestore for live status; the field is removed on success or failure (throttled by `REFRESH_PROGRESS_MIN_MS`).
+- **Refresh progress:** While `runPlaylistRefresh` runs, the playlist document may include ephemeral `refreshProgress` (`phase`, `channelsSoFar`, `sourcesDone` / `sourcesTotal`, optional `detail`, optional `checkpointXtreamRows`). The web app listens over Firestore for live status; the field is removed on success or failure (throttled by `REFRESH_PROGRESS_MIN_MS`).
+- **Xtream checkpoints / resume:** Large Xtream pulls write periodic raw merged checkpoints to Storage. If a refresh fails after at least one checkpoint, the callable promotes the last checkpoint to `playlist.m3u` (rules applied once; TMDB skipped on that promotion) and sets `refreshResume` on the playlist doc so the client can run `refreshPlaylist` with `{ resume: true }` to continue the Xtream source from the saved row offset.
 
 ## Optional per-playlist cap
 
@@ -49,7 +52,7 @@ These limits match the **IPTV Middleware MVP** product requirement: *hard caps s
 - `functions/src/index.ts` — `countUserSources` / `countUserPlaylists`, URL length, `createPlaylist` source checks.
 - `functions/src/refresh.ts` — `assertLimits`, M3U byte cap after merge, upstream `fetchM3u` timeout / retries.
 - `functions/src/xtream.ts` — Xtream HTTP caps, category fan-out, generated M3U size, optional `onProgress` for refresh UI.
-- `functions/src/index.ts` — clears `refreshProgress` when `refreshPlaylist` fails; scheduler catch path clears it too; `getPlaylistEditorData` search length cap and tab filter; `editorHydrationTick` uses editor hydration caps.
+- `functions/src/index.ts` — clears `refreshProgress` when `refreshPlaylist` fails; on failure may run `recoverPartialPlaylistFromCheckpoint` then update `lastError`; scheduler catch path does the same; `getPlaylistEditorData` search length cap and tab filter; `editorHydrationTick` uses editor hydration caps.
 - `functions/src/editorHydration.ts` — `EDITOR_HYDRATION_*` caps for Storage chunking and Firestore progress throttling.
 
 ## TMDB

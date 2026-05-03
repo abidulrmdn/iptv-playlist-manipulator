@@ -41,8 +41,22 @@ export type PlaylistDoc = {
     sourcesDone: number;
     sourcesTotal: number;
     channelsSoFar: number;
+    /** Last Xtream row count persisted to a Storage checkpoint (if any). */
+    checkpointXtreamRows?: number;
     updatedAt?: Timestamp;
   };
+  /** After a failed refresh with checkpoints, client passes `resume: true` to continue Xtream from `skipEmitFirst`. */
+  refreshResume?: {
+    sourceIndex: number;
+    sourceId: string;
+    skipEmitFirst: number;
+  };
+};
+
+export type RefreshResumeDoc = {
+  sourceIndex: number;
+  sourceId: string;
+  skipEmitFirst: number;
 };
 
 function assertLimits(sourcesCount: number, channels: number) {
@@ -464,9 +478,18 @@ export async function runPlaylistRefresh(params: {
   ownerUid: string;
   playlistId: string;
   tmdbApiKey?: string;
+  /** Continue an Xtream source after a partial failure (`refreshResume` + Storage checkpoints). */
+  resume?: boolean;
 }): Promise<{ channelCount: number; etag: string }> {
-  const { db, bucket, ownerUid, playlistId, tmdbApiKey } = params;
+  const { db, bucket, ownerUid, playlistId, tmdbApiKey, resume: wantResume = false } = params;
   const pref = `users/${ownerUid}/playlists/${playlistId}`;
+  const cpRawPath = `${pref}/playlist.checkpoint-raw.m3u`;
+  const cpMetaPath = `${pref}/playlist.checkpoint-meta.json`;
+
+  const clearCheckpointFiles = async () => {
+    await bucket.file(cpRawPath).delete().catch(() => undefined);
+    await bucket.file(cpMetaPath).delete().catch(() => undefined);
+  };
 
   const pSnap = await db.collection("playlists").doc(playlistId).get();
   if (!pSnap.exists) throw new Error("Playlist not found");
@@ -474,11 +497,49 @@ export async function runPlaylistRefresh(params: {
   if (playlist.ownerUid !== ownerUid) throw new Error("Forbidden");
 
   const rules = mergePlaylistRules(playlist.rules);
-  const merged: ChannelEntry[] = [];
+  let merged: ChannelEntry[] = [];
   const sourcesTotal = Math.max(1, playlist.sourceIds.length);
   const channelCap = effectiveMaxChannelsForPlaylist(playlist.maxChannelsToLoad);
 
+  let resumeStartSourceIndex = 0;
+  let resumeSkipEmitFirst = 0;
+
+  if (!wantResume) {
+    await clearCheckpointFiles();
+    await db
+      .collection("playlists")
+      .doc(playlistId)
+      .update({ refreshResume: FieldValue.delete() })
+      .catch(() => undefined);
+  } else {
+    const rr = playlist.refreshResume;
+    const ok =
+      rr &&
+      typeof rr.sourceIndex === "number" &&
+      typeof rr.skipEmitFirst === "number" &&
+      typeof rr.sourceId === "string" &&
+      rr.sourceIndex >= 0 &&
+      rr.sourceIndex < playlist.sourceIds.length &&
+      playlist.sourceIds[rr.sourceIndex] === rr.sourceId;
+    const rawFile = bucket.file(cpRawPath);
+    const [cpExists] = await rawFile.exists();
+    if (ok && cpExists) {
+      const [buf] = await rawFile.download();
+      merged = parseM3u(buf.toString("utf8"));
+      resumeStartSourceIndex = rr!.sourceIndex;
+      resumeSkipEmitFirst = rr!.skipEmitFirst;
+    } else {
+      await clearCheckpointFiles();
+      await db
+        .collection("playlists")
+        .doc(playlistId)
+        .update({ refreshResume: FieldValue.delete() })
+        .catch(() => undefined);
+    }
+  }
+
   let lastProgAt = 0;
+  let checkpointWrites = 0;
   const writeRefreshProgress = async (
     payload: {
       phase: "fetch" | "rules" | "tmdb" | "write";
@@ -486,6 +547,7 @@ export async function runPlaylistRefresh(params: {
       sourcesDone: number;
       sourcesTotal: number;
       channelsSoFar: number;
+      checkpointXtreamRows?: number;
     },
     force: boolean,
   ) => {
@@ -510,15 +572,16 @@ export async function runPlaylistRefresh(params: {
   await writeRefreshProgress(
     {
       phase: "fetch",
-      detail: "Starting…",
+      detail: wantResume ? "Resuming from checkpoint…" : "Starting…",
       sourcesDone: 0,
       sourcesTotal: sourcesTotal,
-      channelsSoFar: 0,
+      channelsSoFar: merged.length,
     },
     true,
   );
 
   for (let si = 0; si < playlist.sourceIds.length; si++) {
+    if (si < resumeStartSourceIndex) continue;
     if (merged.length >= channelCap) break;
     const sid = playlist.sourceIds[si]!;
     const sSnap = await db.collection("sources").doc(sid).get();
@@ -540,6 +603,9 @@ export async function runPlaylistRefresh(params: {
       true,
     );
 
+    const mergedLenBeforeXtream = merged.length;
+    const skipEmitFirst = s.kind === "xtream" && si === resumeStartSourceIndex ? resumeSkipEmitFirst : 0;
+
     let text: string;
     if (s.kind === "xtream") {
       if (!s.xtreamEnc) {
@@ -549,6 +615,7 @@ export async function runPlaylistRefresh(params: {
       const cfg = JSON.parse(plain) as { baseUrl: string; username: string; password: string };
       text = await fetchXtreamM3uText(cfg, {
         maxChannels: remainingForSource,
+        skipEmitFirst,
         onProgress: ({ built, detail }) => {
           void writeRefreshProgress(
             {
@@ -556,10 +623,49 @@ export async function runPlaylistRefresh(params: {
               detail: detail || `Xtream · source ${si + 1} of ${playlist.sourceIds.length}`,
               sourcesDone: si,
               sourcesTotal: sourcesTotal,
-              channelsSoFar: merged.length + built,
+              channelsSoFar: mergedLenBeforeXtream + built - skipEmitFirst,
             },
             false,
           );
+        },
+        onCheckpoint: async ({ totalXtreamEmitted, channels: xtTail }) => {
+          if (checkpointWrites >= LIMITS.REFRESH_CHECKPOINT_MAX_STORAGE_WRITES) return;
+          const mergedSoFar = [...merged, ...xtTail];
+          const rawBody = serializeM3u(mergedSoFar);
+          if (Buffer.byteLength(rawBody, "utf8") > LIMITS.MAX_M3U_BYTES) return;
+          try {
+            await bucket.file(cpRawPath).save(rawBody, {
+              contentType: "audio/x-mpegurl",
+              resumable: false,
+              metadata: { cacheControl: "private, max-age=0" },
+            });
+            await bucket.file(cpMetaPath).save(
+              JSON.stringify({
+                sourceIndex: si,
+                sourceId: sid,
+                skipEmitFirst: totalXtreamEmitted,
+              }),
+              {
+                contentType: "application/json",
+                resumable: false,
+                metadata: { cacheControl: "private, max-age=0" },
+              },
+            );
+            checkpointWrites++;
+            await writeRefreshProgress(
+              {
+                phase: "fetch",
+                detail: `Xtream · checkpoint ${totalXtreamEmitted.toLocaleString()} rows · source ${si + 1} of ${playlist.sourceIds.length}`,
+                sourcesDone: si,
+                sourcesTotal: sourcesTotal,
+                channelsSoFar: mergedSoFar.length,
+                checkpointXtreamRows: totalXtreamEmitted,
+              },
+              true,
+            );
+          } catch (e) {
+            console.error("[runPlaylistRefresh] onCheckpoint save failed", e);
+          }
         },
       });
     } else {
@@ -704,6 +810,7 @@ export async function runPlaylistRefresh(params: {
   });
 
   const nextDue = Timestamp.fromMillis(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  await clearCheckpointFiles();
   await db
     .collection("playlists")
     .doc(playlistId)
@@ -712,6 +819,7 @@ export async function runPlaylistRefresh(params: {
       lastSuccessAt: FieldValue.serverTimestamp(),
       lastError: FieldValue.delete(),
       refreshProgress: FieldValue.delete(),
+      refreshResume: FieldValue.delete(),
       channelCount: finalChannels.length,
       etag,
       storagePath: mainPath,
@@ -721,4 +829,147 @@ export async function runPlaylistRefresh(params: {
   await invalidateEditorHydrationCache(db, bucket, ownerUid, playlistId);
 
   return { channelCount: finalChannels.length, etag };
+}
+
+/**
+ * If a checkpoint exists from a failed refresh, promote it to `playlist.m3u` (rules applied; no TMDB)
+ * and set `refreshResume` so the client can call `refreshPlaylist` with `{ resume: true }`.
+ * Returns a short user-facing suffix for `lastError`, or `null` if no checkpoint.
+ */
+export async function recoverPartialPlaylistFromCheckpoint(params: {
+  db: Firestore;
+  bucket: Bucket;
+  ownerUid: string;
+  playlistId: string;
+}): Promise<string | null> {
+  const { db, bucket, ownerUid, playlistId } = params;
+  const pref = `users/${ownerUid}/playlists/${playlistId}`;
+  const metaFile = bucket.file(`${pref}/playlist.checkpoint-meta.json`);
+  const rawFile = bucket.file(`${pref}/playlist.checkpoint-raw.m3u`);
+  const [metaExists] = await metaFile.exists();
+  const [rawExists] = await rawFile.exists();
+  if (!metaExists || !rawExists) return null;
+
+  const pSnap = await db.collection("playlists").doc(playlistId).get();
+  if (!pSnap.exists) return null;
+  const playlist = pSnap.data() as PlaylistDoc;
+  if (playlist.ownerUid !== ownerUid) return null;
+
+  let meta: RefreshResumeDoc;
+  try {
+    const [mb] = await metaFile.download();
+    meta = JSON.parse(mb.toString("utf8")) as RefreshResumeDoc;
+  } catch {
+    return null;
+  }
+  if (
+    !Number.isFinite(meta.sourceIndex) ||
+    !Number.isFinite(meta.skipEmitFirst) ||
+    typeof meta.sourceId !== "string" ||
+    meta.sourceIndex < 0 ||
+    meta.sourceIndex >= playlist.sourceIds.length ||
+    playlist.sourceIds[meta.sourceIndex] !== meta.sourceId
+  ) {
+    return null;
+  }
+
+  const [rawBuf] = await rawFile.download();
+  const merged = parseM3u(rawBuf.toString("utf8"));
+  if (merged.length === 0) return null;
+
+  const rules = mergePlaylistRules(playlist.rules);
+  const { kept: stable, dropped: rulesDropped } = partitionRulesKeptDropped(merged, rules);
+
+  const prevFile = bucket.file(`${pref}/canonical-ids.json`);
+  const [prevExists] = await prevFile.exists();
+  let previousIds = new Set<string>();
+  if (prevExists) {
+    const [buf] = await prevFile.download();
+    try {
+      const arr = JSON.parse(buf.toString("utf8")) as string[];
+      previousIds = new Set(arr);
+    } catch {
+      previousIds = new Set();
+    }
+  }
+
+  const stableIds = [...new Set(stable.map((ch) => canonicalId(ch)))];
+  const duplicateNewIntoLatest = playlist.duplicateNewIntoLatest !== false;
+  const finalChannels = buildFinalChannels({
+    stable,
+    previousIds,
+    hadPreviousSnapshot: prevExists,
+    rules,
+    duplicateNewIntoLatest,
+  });
+
+  let body = serializeM3u(finalChannels);
+  if (Buffer.byteLength(body, "utf8") > LIMITS.MAX_M3U_BYTES) {
+    return null;
+  }
+
+  const etag = createHash("sha256").update(body).digest("hex").slice(0, 16);
+  const mainPath = `${pref}/playlist.m3u`;
+  await rotatePlaylistM3uSnapshots(bucket, pref, LIMITS.SNAPSHOTS_RETAINED);
+  await bucket.file(mainPath).save(body, {
+    contentType: "audio/x-mpegurl",
+    resumable: false,
+    metadata: { cacheControl: "public, max-age=300" },
+  });
+
+  const droppedPath = `${pref}/playlist.editor-rules-dropped.m3u`;
+  if (rulesDropped.length > 0) {
+    const droppedBody = serializeM3u(rulesDropped);
+    if (Buffer.byteLength(droppedBody, "utf8") <= LIMITS.MAX_M3U_BYTES) {
+      await bucket.file(droppedPath).save(droppedBody, {
+        contentType: "audio/x-mpegurl",
+        resumable: false,
+        metadata: { cacheControl: "private, max-age=0" },
+      });
+    } else {
+      await bucket.file(droppedPath).delete().catch(() => undefined);
+    }
+  } else {
+    await bucket.file(droppedPath).delete().catch(() => undefined);
+  }
+
+  await bucket.file(`${pref}/canonical-ids.json`).save(JSON.stringify(stableIds), {
+    contentType: "application/json",
+    resumable: false,
+  });
+
+  const newCount =
+    prevExists && previousIds.size > 0 ? stableIds.filter((id) => !previousIds.has(id)).length : 0;
+  const removedApprox = prevExists ? [...previousIds].filter((id) => !stableIds.includes(id)).length : 0;
+  const diffSummary = {
+    previousCount: previousIds.size,
+    currentCount: stableIds.length,
+    newCount,
+    removedApprox,
+    updatedAt: new Date().toISOString(),
+  };
+  await bucket.file(`${pref}/diff-summary.json`).save(JSON.stringify(diffSummary), {
+    contentType: "application/json",
+    resumable: false,
+  });
+
+  await db
+    .collection("playlists")
+    .doc(playlistId)
+    .update({
+      updatedAt: FieldValue.serverTimestamp(),
+      refreshProgress: FieldValue.delete(),
+      refreshResume: {
+        sourceIndex: meta.sourceIndex,
+        sourceId: meta.sourceId,
+        skipEmitFirst: meta.skipEmitFirst,
+      },
+      channelCount: finalChannels.length,
+      etag,
+      storagePath: mainPath,
+    });
+
+  await invalidateEditorHydrationCache(db, bucket, ownerUid, playlistId);
+
+  return `Last checkpoint was published to your player file (${finalChannels.length.toLocaleString()} channels after rules; TMDB not applied on this partial). Use “Resume refresh from checkpoint” in the app to continue the Xtream source from row ${meta.skipEmitFirst.toLocaleString()}.`;
 }

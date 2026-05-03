@@ -62,6 +62,10 @@ export const LIMITS = {
   XTREAM_REQUEST_GAP_MS: 120,
   /** Min interval between Firestore `refreshProgress` writes during a playlist refresh. */
   REFRESH_PROGRESS_MIN_MS: 2_000,
+  /** During Xtream catalog build, write a Storage checkpoint every N emitted rows (raw merged prefix). */
+  REFRESH_XTREAM_CHECKPOINT_CHANNELS: 10_000,
+  /** Max Storage checkpoint writes per playlist refresh (caps cost if a catalog is huge). */
+  REFRESH_CHECKPOINT_MAX_STORAGE_WRITES: 40,
   MAX_LABEL_LENGTH: 120,
   MAX_PLAYLIST_NAME_LENGTH: 80,
   /** Max concurrent TMDB lookups per refresh (Milestone B). */

@@ -5,6 +5,8 @@ export type PlaylistRefreshProgress = {
   sourcesDone: number;
   sourcesTotal: number;
   channelsSoFar: number;
+  /** Xtream row count last written to a Storage checkpoint (if any). */
+  checkpointXtreamRows?: number;
 };
 
 function num(x: unknown): number {
@@ -30,5 +32,9 @@ export function formatRefreshProgressLine(r: PlaylistRefreshProgress): string {
             ? "Saving"
             : r.phase;
   const det = typeof r.detail === "string" && r.detail.trim() ? ` · ${r.detail.trim()}` : "";
-  return `${ph}: ${ch} channels${src}${det}`;
+  const ck =
+    typeof r.checkpointXtreamRows === "number" && Number.isFinite(r.checkpointXtreamRows) && r.checkpointXtreamRows > 0
+      ? ` · last checkpoint ${num(r.checkpointXtreamRows).toLocaleString()} Xtream rows`
+      : "";
+  return `${ph}: ${ch} channels${src}${det}${ck}`;
 }

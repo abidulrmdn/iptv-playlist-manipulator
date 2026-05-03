@@ -5,6 +5,7 @@ import { Link, useParams } from "react-router-dom";
 import { onAuthStateChanged, signOut, type User } from "firebase/auth";
 import { doc, onSnapshot } from "firebase/firestore";
 import { auth, callable, db, publicPlaylistUrl } from "./firebase";
+import { ExpandableHelp, InlineHelp } from "./uiHelp";
 import { hashEditorFilterKey } from "./editorFilterKey";
 import { formatRefreshProgressLine, type PlaylistRefreshProgress } from "./refreshProgressFormat";
 import { LIMITS, type PlaylistRules, type RulePatternTabScope } from "../../functions/src/constants";
@@ -115,10 +116,10 @@ function GroupHeaderCheckbox({
 function TabPill({ tab }: { tab: EditorTab }) {
   const cls =
     tab === "tv"
-      ? "border-emerald-800/50 bg-emerald-950/40 text-emerald-200"
+      ? "border-emerald-600/45 bg-emerald-600/15 text-emerald-100"
       : tab === "movie"
-        ? "border-amber-800/50 bg-amber-950/40 text-amber-200"
-        : "border-sky-800/50 bg-sky-950/40 text-sky-200";
+        ? "border-amber-600/45 bg-amber-600/15 text-amber-100"
+        : "border-sky-600/45 bg-sky-600/15 text-sky-100";
   return (
     <span className={`shrink-0 rounded-md border px-2 py-1 text-[10px] font-semibold uppercase tracking-wide ${cls}`}>
       {tab}
@@ -135,7 +136,7 @@ function ChannelThumb({ row }: { row: EditorRow }) {
         loading="lazy"
         decoding="async"
         referrerPolicy="no-referrer"
-        className="h-11 w-11 shrink-0 rounded-lg border border-zinc-700/80 bg-zinc-950 object-cover"
+        className="h-11 w-11 shrink-0 rounded-lg border border-zinc-700/80 bg-zinc-900 object-cover"
         onContextMenu={(e) => e.preventDefault()}
       />
     );
@@ -196,7 +197,7 @@ function VirtualGroupChannelList({
               role="listitem"
               data-index={vi.index}
               ref={virtualizer.measureElement}
-              className={`absolute left-0 top-0 box-border flex w-full max-w-full gap-3 border-b border-zinc-800/90 px-4 py-3 transition-colors hover:bg-zinc-800/25 ${
+              className={`absolute left-0 top-0 box-border flex w-full max-w-full gap-3 border-b border-zinc-600/35 px-4 py-3 transition-colors hover:bg-zinc-700/20 ${
                 selected.has(r.id) ? "bg-emerald-500/5 ring-1 ring-inset ring-emerald-500/25" : ""
               }`}
               style={{ transform: `translateY(${vi.start}px)` }}
@@ -247,8 +248,8 @@ function VirtualGroupChannelList({
               <ChannelThumb row={r} />
               <div className="min-w-0 flex-1">
                 <div className="line-clamp-2 text-sm font-medium leading-snug text-zinc-100">{r.title}</div>
-                {r.tvgName ? <div className="mt-0.5 line-clamp-1 text-xs text-zinc-500">{r.tvgName}</div> : null}
-                <div className="mt-1.5 break-all font-mono text-[11px] leading-relaxed text-zinc-500 lg:text-xs">{r.url}</div>
+                {r.tvgName ? <div className="mt-0.5 line-clamp-1 text-xs text-zinc-400">{r.tvgName}</div> : null}
+                <div className="mt-1.5 break-all font-mono text-[11px] leading-relaxed text-zinc-400 lg:text-xs">{r.url}</div>
               </div>
               <div className="flex shrink-0 flex-col items-end gap-1 pt-0.5">
                 <TabPill tab={r.tab} />
@@ -327,30 +328,18 @@ function fieldLabel(field: "name" | "group" | "url"): string {
 }
 
 /** Organizer toolbar: shared button + cluster styles for a tighter control strip. */
-const orgCluster = "inline-flex flex-wrap items-center gap-1 rounded-xl border border-zinc-800/90 bg-zinc-950/55 p-1 shadow-sm";
+const orgCluster =
+  "inline-flex flex-wrap items-center gap-1 rounded-xl border-2 border-zinc-300/40 bg-zinc-800 p-1 shadow-md shadow-black/25 ring-1 ring-zinc-950/30";
 const orgBtn =
-  "min-h-10 rounded-lg px-3 py-2 text-sm text-zinc-200 transition hover:bg-zinc-800/90 disabled:pointer-events-none disabled:opacity-40 sm:min-h-0";
+  "min-h-10 rounded-lg px-3 py-2 text-sm text-zinc-100 transition hover:bg-zinc-700/95 disabled:pointer-events-none disabled:opacity-40 sm:min-h-0";
 const orgBtnOutline = `${orgBtn} border border-zinc-600/60 hover:border-zinc-500`;
 const orgBtnEmerald = `${orgBtn} border border-emerald-600/35 bg-emerald-500/12 font-medium text-emerald-100 hover:bg-emerald-500/22`;
-const orgBtnAmber = `${orgBtn} border border-amber-700/45 bg-amber-950/35 text-amber-100 hover:bg-amber-950/55`;
-const orgBtnSkyLine = `${orgBtn} border border-sky-700/45 bg-sky-950/25 text-sky-100 hover:bg-sky-950/45`;
+const orgBtnAmber = `${orgBtn} border border-amber-600/40 bg-amber-600/15 text-amber-100 hover:bg-amber-600/25`;
+const orgBtnSkyLine = `${orgBtn} border border-sky-600/40 bg-sky-600/12 text-sky-100 hover:bg-sky-600/22`;
 const orgBtnSkySolid =
   "min-h-11 rounded-lg bg-sky-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-sky-500 disabled:pointer-events-none disabled:opacity-40 sm:min-h-0 sm:py-2";
 
 const PLAYLIST_ORG_SIDEBAR_KEY = "playlistOrganizer.playlistSidebarOpen";
-
-function InlineHelp({ text }: { text: string }) {
-  return (
-    <span
-      className="ml-1 inline-flex h-5 w-5 shrink-0 cursor-help select-none items-center justify-center rounded-full border border-zinc-600 text-[10px] font-bold text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
-      title={text}
-      role="img"
-      aria-label={text}
-    >
-      ?
-    </span>
-  );
-}
 
 type EditorDataSet = "player" | "rulesDropped";
 
@@ -463,10 +452,16 @@ export function PlaylistOrganizer() {
   }, []);
 
   const [refreshProgress, setRefreshProgress] = useState<PlaylistRefreshProgress | null>(null);
+  const [refreshResume, setRefreshResume] = useState<{
+    sourceIndex: number;
+    sourceId: string;
+    skipEmitFirst: number;
+  } | null>(null);
 
   useEffect(() => {
     if (!playlistId || !user) {
       setRefreshProgress(null);
+      setRefreshResume(null);
       return;
     }
     const unsub = onSnapshot(
@@ -474,6 +469,7 @@ export function PlaylistOrganizer() {
       (snap) => {
         if (!snap.exists()) {
           setRefreshProgress(null);
+          setRefreshResume(null);
           setEditorHydrationDoc(null);
           return;
         }
@@ -484,6 +480,17 @@ export function PlaylistOrganizer() {
         } else {
           setRefreshProgress(null);
         }
+        const rr = row?.refreshResume as unknown;
+        setRefreshResume(
+          rr &&
+            typeof rr === "object" &&
+            rr !== null &&
+            typeof (rr as { sourceIndex?: unknown }).sourceIndex === "number" &&
+            typeof (rr as { sourceId?: unknown }).sourceId === "string" &&
+            typeof (rr as { skipEmitFirst?: unknown }).skipEmitFirst === "number"
+            ? (rr as { sourceIndex: number; sourceId: string; skipEmitFirst: number })
+            : null,
+        );
         const eh = row?.editorHydration as unknown;
         if (
           eh &&
@@ -501,6 +508,7 @@ export function PlaylistOrganizer() {
       },
       () => {
         setRefreshProgress(null);
+        setRefreshResume(null);
         setEditorHydrationDoc(null);
       },
     );
@@ -983,16 +991,23 @@ export function PlaylistOrganizer() {
 
   const clearSel = () => setSelected(new Set());
 
-  const rebuildM3u = async () => {
+  const rebuildM3u = async (opts?: { resume?: boolean }) => {
     if (!playlistId) return;
     setBusy(true);
     try {
       rulesSaveGeneration.current += 1;
-      const fn = callable<{ playlistId: string }, { ok: boolean; channelCount: number }>("refreshPlaylist", {
+      const fn = callable<
+        { playlistId: string; resume?: boolean },
+        { ok: boolean; channelCount: number }
+      >("refreshPlaylist", {
         timeout: 600_000,
       });
-      await fn({ playlistId });
-      notify("Player file updated — reloading this table from the server…");
+      await fn({ playlistId, resume: Boolean(opts?.resume) });
+      notify(
+        opts?.resume
+          ? "Resume finished — reloading this table from the server…"
+          : "Player file updated — reloading this table from the server…",
+      );
       await load();
     } catch (e) {
       notify(errMsg(e));
@@ -1305,7 +1320,7 @@ export function PlaylistOrganizer() {
 
   if (!user) {
     return (
-      <div className="flex min-h-[100dvh] items-center justify-center bg-zinc-950 px-4 py-8">
+      <div className="flex min-h-[100dvh] items-center justify-center bg-zinc-600 px-4 py-8">
         <p className="text-zinc-400">
           Sign in from the{" "}
           <Link className="text-emerald-400 underline" to="/">
@@ -1318,16 +1333,16 @@ export function PlaylistOrganizer() {
   }
 
   return (
-    <div className="flex min-h-[100dvh] flex-col bg-gradient-to-b from-zinc-950 via-zinc-900 to-zinc-950 text-zinc-100 md:flex-row">
+    <div className="flex min-h-[100dvh] flex-col bg-gradient-to-b from-zinc-800 via-zinc-600 to-zinc-800 text-zinc-100 md:flex-row">
       <aside
-        className={`z-20 flex shrink-0 flex-col border-zinc-800 bg-zinc-950/95 backdrop-blur md:sticky md:top-0 md:h-screen md:max-h-screen md:border-r md:shadow-xl md:shadow-black/30 md:transition-[width] md:duration-200 md:ease-out ${
+        className={`z-20 flex shrink-0 flex-col border-zinc-300/45 bg-zinc-700/98 shadow-xl shadow-black/25 backdrop-blur md:sticky md:top-0 md:h-screen md:max-h-screen md:transition-[width] md:duration-200 md:ease-out border-b-2 md:border-b-0 md:border-r-2 ${
           playlistSidebarOpen
             ? "max-h-[min(52vh,24rem)] w-full overflow-y-auto border-b md:max-h-none md:w-[min(22rem,calc(100vw-0.5rem))] sm:md:w-80"
             : "w-full border-b md:h-screen md:w-14 md:border-b-0"
         }`}
       >
         <div
-          className={`flex shrink-0 items-center gap-2 border-b border-zinc-800 px-2 py-2.5 md:border-b-0 ${playlistSidebarOpen ? "" : "justify-center md:justify-start"}`}
+          className={`flex shrink-0 items-center gap-2 border-b-2 border-zinc-400/35 px-2 py-2.5 md:border-b-0 ${playlistSidebarOpen ? "" : "justify-center md:justify-start"}`}
         >
           {playlistSidebarOpen ? (
             <>
@@ -1342,7 +1357,7 @@ export function PlaylistOrganizer() {
                 aria-controls="playlist-organizer-sidebar"
                 aria-label="Collapse playlist sidebar"
                 onClick={togglePlaylistSidebar}
-                className="shrink-0 rounded-lg border border-zinc-700/80 p-2 text-sm text-zinc-400 hover:bg-zinc-800 hover:text-white"
+                className="shrink-0 rounded-lg border border-zinc-600 bg-zinc-900/60 p-2 text-sm text-zinc-300 hover:bg-zinc-800 hover:text-white"
               >
                 ‹
               </button>
@@ -1355,7 +1370,7 @@ export function PlaylistOrganizer() {
               aria-controls="playlist-organizer-sidebar"
               aria-label="Expand playlist sidebar"
               onClick={togglePlaylistSidebar}
-              className="flex min-h-11 w-full items-center justify-center gap-2 rounded-lg border border-zinc-700/60 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800 hover:text-white md:mx-auto md:h-10 md:w-10 md:gap-0 md:border-zinc-700/80 md:px-0 md:text-lg"
+              className="flex min-h-11 w-full items-center justify-center gap-2 rounded-lg border border-zinc-600 bg-zinc-900/50 px-3 py-2 text-sm text-zinc-200 hover:bg-zinc-800 hover:text-white md:mx-auto md:h-10 md:w-10 md:gap-0 md:px-0 md:text-lg"
             >
               <span className="font-medium md:sr-only">Playlist menu</span>
               <span aria-hidden>›</span>
@@ -1368,44 +1383,84 @@ export function PlaylistOrganizer() {
             className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto overflow-x-hidden p-4"
           >
             <div>
-              <p className="text-xs uppercase tracking-wide text-zinc-500">Visual playlist editor</p>
-              <p className="mt-2 text-xs leading-relaxed text-zinc-500">
-                Use <strong className="font-normal text-zinc-400">In player file</strong> to match what your IPTV app loads today, or{" "}
-                <strong className="font-normal text-zinc-400">Hidden by rules</strong> to see channels the server stripped on the last
-                refresh. Filters, order, and checkboxes <strong className="font-normal text-zinc-400">save automatically</strong>.
-              </p>
+              <p className="text-xs uppercase tracking-wide text-zinc-400">Visual playlist editor</p>
+              <ExpandableHelp label="Editor basics" variant="compact" className="mt-2">
+                <p>
+                  Use <strong>In player file</strong> to match what your IPTV app loads today, or <strong>Hidden by rules</strong> to
+                  see channels the server stripped on the last refresh. Filters, order, and checkboxes{" "}
+                  <strong>save automatically</strong>.
+                </p>
+              </ExpandableHelp>
             </div>
             <div className="flex flex-wrap gap-2">
-              <Link className="rounded-lg border border-zinc-600 px-3 py-1.5 text-sm hover:bg-zinc-800" to="/">
+              <Link className="rounded-lg border border-zinc-600 bg-zinc-900/50 px-3 py-1.5 text-sm text-zinc-200 hover:bg-zinc-800" to="/">
                 Main app
               </Link>
-              <button type="button" onClick={() => void signOut(auth)} className="rounded-lg border border-zinc-700 px-3 py-1.5 text-sm">
+              <button
+                type="button"
+                onClick={() => void signOut(auth)}
+                className="rounded-lg border border-zinc-600 bg-zinc-900/50 px-3 py-1.5 text-sm text-zinc-200 hover:bg-zinc-800"
+              >
                 Sign out
               </button>
             </div>
-            <div className="flex flex-col gap-2">
-              <div className="flex w-full items-center gap-0.5">
-                <button
-                  type="button"
-                  disabled={busy || serverReportsRefreshInFlight}
-                  onClick={() => void rebuildM3u()}
-                  title={
-                    serverReportsRefreshInFlight
-                      ? "The server is already rebuilding this playlist — wait for it to finish, or watch the status line below."
-                      : "Downloads fresh M3U from each saved source, merges them, applies your rules and order, then overwrites the hosted file behind your player URL."
-                  }
-                  className="min-w-0 flex-1 rounded-lg bg-emerald-500 px-2 py-2.5 text-sm font-semibold leading-snug text-emerald-950 hover:bg-emerald-400 disabled:opacity-40"
-                >
-                  {serverReportsRefreshInFlight ? "Continue loading…" : "Refresh player file from sources"}
-                </button>
-                <InlineHelp text="Downloads fresh M3U from each saved source, merges them, applies your rules and order, then overwrites the hosted file behind your player URL. Your app keeps the same URL; large lists can take several minutes. If you reload the page while a refresh runs, this button shows “Continue loading…” until the server finishes." />
+            <div className="flex flex-col gap-3">
+              <div className="rounded-xl border border-zinc-600/60 bg-zinc-950/45 p-3 ring-1 ring-white/[0.04]">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-zinc-400">Rebuild player file (providers)</p>
+                <p className="mt-1 text-[11px] leading-snug text-zinc-500">
+                  Calls your M3U/Xtream sources on the server. Use “Reload table” below if you only need the editor view refreshed.
+                </p>
+                <div className="mt-2 flex flex-col gap-2">
+                  <div className="flex w-full items-start gap-0.5">
+                    <button
+                      type="button"
+                      disabled={busy || serverReportsRefreshInFlight}
+                      onClick={() => void rebuildM3u()}
+                      title={
+                        serverReportsRefreshInFlight
+                          ? "The server is already rebuilding this playlist — wait for it to finish, or watch the status line below."
+                          : "Re-downloads all sources from scratch; clears any Xtream checkpoint."
+                      }
+                      className="min-w-0 flex-1 rounded-lg bg-emerald-500 px-2 py-2.5 text-left text-sm font-semibold leading-snug text-emerald-950 hover:bg-emerald-400 disabled:opacity-40"
+                    >
+                      {serverReportsRefreshInFlight ? (
+                        "Continue loading…"
+                      ) : (
+                        <>
+                          <span className="block">Full rebuild — all sources</span>
+                          <span className="mt-0.5 block text-[11px] font-normal text-emerald-950/85">Clears checkpoint · starts over</span>
+                        </>
+                      )}
+                    </button>
+                    <InlineHelp text="Re-downloads every source, merges, applies rules, overwrites the hosted M3U. Large Xtream lists can take many minutes." />
+                  </div>
+                  {refreshResume ? (
+                    <div className="rounded-lg border border-amber-600/45 bg-amber-950/25 p-2">
+                      <p className="text-[10px] font-semibold uppercase tracking-wide text-amber-200/90">Resume interrupted Xtream</p>
+                      <p className="mt-1 text-[11px] leading-snug text-amber-100/90">
+                        Saved through row <span className="font-mono">{refreshResume.skipEmitFirst.toLocaleString()}</span> (source #
+                        {refreshResume.sourceIndex + 1}).
+                      </p>
+                      <button
+                        type="button"
+                        disabled={busy || serverReportsRefreshInFlight}
+                        onClick={() => void rebuildM3u({ resume: true })}
+                        title="Continues the Xtream catalog from the saved row; does not re-fetch earlier sources from scratch."
+                        className="mt-1.5 w-full rounded-lg border border-amber-500/70 bg-amber-600/20 px-2 py-2 text-left text-xs font-semibold text-amber-50 hover:bg-amber-600/30 disabled:opacity-40"
+                      >
+                        <span className="block">Resume from checkpoint</span>
+                        <span className="mt-0.5 block text-[10px] font-normal text-amber-100/80">Not a full rebuild — skips already-merged rows</span>
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
               </div>
               {refreshProgress ? (
                 <p className="text-center text-xs leading-snug text-amber-200/90" aria-live="polite">
                   {formatRefreshProgressLine(refreshProgress)}
                 </p>
               ) : null}
-              <p className="text-center text-[11px] text-zinc-500" aria-live="polite">
+              <p className="text-center text-[11px] text-zinc-400" aria-live="polite">
                 {rulesAutosaveState === "saving" ? (
                   <span className="text-sky-300/90">Saving…</span>
                 ) : rulesAutosaveState === "saved" ? (
@@ -1414,23 +1469,26 @@ export function PlaylistOrganizer() {
                   <span>Rules save automatically</span>
                 )}
               </p>
-              <div className="flex w-full items-center gap-0.5">
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => void load()}
-                  title="Discards unsaved-in-memory table state: re-downloads the current list from Firebase for this data source (player file or hidden-by-rules), reapplies your saved rules metadata, and resets pagination to the first page."
-                  className="min-w-0 flex-1 rounded-lg border border-zinc-600 px-2 py-2.5 text-sm leading-snug hover:bg-zinc-800 disabled:opacity-40"
-                >
-                  Reload table from server
-                </button>
-                <InlineHelp text="Fetches the latest channel list from the server for whichever data source is selected next to the category tabs (player file vs hidden by rules). Use this if the table looks stale after a refresh elsewhere, without running a full source pull again." />
+              <div className="rounded-xl border border-zinc-600/50 bg-zinc-900/40 p-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-zinc-400">Editor only (no Xtream / M3U fetch)</p>
+                <div className="mt-2 flex w-full items-center gap-0.5">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void load()}
+                    title="Re-downloads the channel table from Firebase for the current view only. Does not call your IPTV provider."
+                    className="min-w-0 flex-1 rounded-lg border border-zinc-600 px-2 py-2.5 text-sm leading-snug hover:bg-zinc-800 disabled:opacity-40"
+                  >
+                    Reload table from server
+                  </button>
+                  <InlineHelp text="Refreshes this page’s channel list from the last built player file (or rules-dropped snapshot). Does not hit Xtream or M3U URLs — use Full rebuild for that." />
+                </div>
               </div>
             </div>
             {publicToken ? (
-              <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-3">
-                <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">Player URL</p>
-                <code className="mt-1 block break-all text-[11px] leading-snug text-emerald-200/90">{publicPlaylistUrl(publicToken)}</code>
+              <div className="rounded-lg border-2 border-zinc-300/35 bg-zinc-900/85 p-3 shadow-md ring-1 ring-zinc-950/30">
+                <p className="text-xs font-medium uppercase tracking-wide text-zinc-400">Player URL</p>
+                <code className="mt-1 block break-all text-[11px] leading-snug text-emerald-200">{publicPlaylistUrl(publicToken)}</code>
               </div>
             ) : null}
           </div>
@@ -1439,14 +1497,14 @@ export function PlaylistOrganizer() {
 
       <div className="min-h-0 min-w-0 flex-1 overflow-x-hidden pb-[env(safe-area-inset-bottom,0px)]">
         <div className="mx-auto max-w-7xl space-y-4 px-3 py-4 sm:px-4 sm:py-6">
-          <div className="flex flex-wrap items-center gap-2 rounded-xl border border-zinc-800 bg-zinc-900/50 p-3">
+          <div className="flex flex-wrap items-center gap-2 rounded-xl border-2 border-zinc-300/40 bg-zinc-800 p-3 shadow-lg shadow-black/30 ring-1 ring-zinc-950/30">
           {(["all", "tv", "movie", "series"] as const).map((t) => (
             <button
               key={t}
               type="button"
               onClick={() => setTab(t)}
               className={`rounded-lg px-3 py-1.5 text-sm font-medium ${
-                tab === t ? "bg-emerald-500 text-emerald-950" : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
+                tab === t ? "bg-emerald-500 text-emerald-950" : "bg-zinc-700 text-zinc-100 hover:bg-zinc-600"
               }`}
             >
               {t === "all"
@@ -1458,7 +1516,7 @@ export function PlaylistOrganizer() {
                     : `Series (${(totalsByTab?.series ?? visible.filter((r) => r.tab === "series").length).toLocaleString()})`}
             </button>
           ))}
-          <span className="ml-auto text-xs text-zinc-500">
+          <span className="ml-auto text-xs text-zinc-400">
             {listLoading ? <span className="mr-2 text-sky-400/90">Updating list…</span> : null}
             {editorHydrationDoc &&
             editorHydrationDoc.state === "running" &&
@@ -1482,14 +1540,14 @@ export function PlaylistOrganizer() {
           </span>
         </div>
 
-        <div className="flex flex-col gap-2 rounded-xl border border-zinc-800 bg-zinc-950/40 p-3 sm:flex-row sm:flex-wrap sm:items-center">
-          <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Data source</span>
-          <div className="flex flex-wrap gap-1 rounded-lg bg-zinc-900/90 p-0.5">
+        <div className="flex flex-col gap-2 rounded-xl border-2 border-zinc-300/40 bg-zinc-800 p-3 shadow-md ring-1 ring-zinc-950/28 sm:flex-row sm:flex-wrap sm:items-center">
+          <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide text-zinc-400">Data source</span>
+          <div className="flex flex-wrap gap-1 rounded-lg border-2 border-zinc-300/35 bg-zinc-900/90 p-0.5 shadow-inner">
             <button
               type="button"
               onClick={() => setEditorDataSet("player")}
               className={`rounded-md px-3 py-1.5 text-sm font-medium ${
-                editorDataSet === "player" ? "bg-emerald-500 text-emerald-950" : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+                editorDataSet === "player" ? "bg-emerald-500 text-emerald-950" : "text-zinc-300 hover:bg-zinc-700 hover:text-white"
               }`}
             >
               In player file
@@ -1500,20 +1558,22 @@ export function PlaylistOrganizer() {
               className={`rounded-md px-3 py-1.5 text-sm font-medium ${
                 editorDataSet === "rulesDropped"
                   ? "bg-violet-500 text-violet-950"
-                  : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+                  : "text-zinc-300 hover:bg-zinc-700 hover:text-white"
               }`}
             >
               Hidden by rules (last rebuild)
             </button>
           </div>
-          <p className="text-xs leading-snug text-zinc-500 sm:ml-auto sm:max-w-xl">
-            {editorDataSet === "player"
-              ? "Table rows match the hosted M3U your IPTV app uses. The “hidden by rules” count is a live preview: rows still in the file that your saved rules would remove before the next refresh."
-              : "Rows the server removed when it last built the player file. Select any you want back and tap Include again to add allow patterns, then refresh the player file."}
-          </p>
+          <ExpandableHelp label="What this data source means" variant="compact" className="sm:ml-auto sm:max-w-xl">
+            <p>
+              {editorDataSet === "player"
+                ? "Table rows match the hosted M3U your IPTV app uses. The “hidden by rules” count is a live preview: rows still in the file that your saved rules would remove before the next refresh."
+                : "Rows the server removed when it last built the player file. Select any you want back and tap Include again to add allow patterns, then refresh the player file."}
+            </p>
+          </ExpandableHelp>
         </div>
 
-        <div className="flex flex-wrap gap-6 rounded-xl border border-zinc-800 bg-zinc-900/40 px-4 py-3 text-sm text-zinc-300">
+        <div className="flex flex-wrap gap-6 rounded-xl border-2 border-zinc-300/40 bg-zinc-800/95 px-4 py-3 text-sm text-zinc-100 shadow-md ring-1 ring-zinc-950/28">
           <label className="flex cursor-pointer items-center gap-2">
             <input type="checkbox" checked={enrichEnabled} onChange={(e) => setEnrichEnabled(e.target.checked)} />
             TMDB enrichment (next rebuild)
@@ -1524,17 +1584,17 @@ export function PlaylistOrganizer() {
           </label>
         </div>
 
-        <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4 shadow-sm">
-          <div className="flex flex-col gap-1.5 border-b border-zinc-800/80 pb-4">
+        <div className="rounded-xl border-2 border-zinc-300/40 bg-zinc-800 p-4 shadow-xl shadow-black/30 ring-1 ring-zinc-950/30">
+          <div className="flex flex-col gap-1.5 border-b border-zinc-600/50 pb-4">
             <label className="flex flex-col gap-1.5 sm:flex-row sm:items-end sm:gap-4">
-              <span className="shrink-0 text-xs font-medium uppercase tracking-wide text-zinc-500">
+              <span className="shrink-0 text-xs font-medium uppercase tracking-wide text-zinc-400">
                 Search playlist
                 {q.trim() !== serverQuery ? (
-                  <span className="mt-0.5 block font-normal normal-case text-zinc-600">Typing…</span>
+                  <span className="mt-0.5 block font-normal normal-case text-zinc-500">Typing…</span>
                 ) : null}
               </span>
               <input
-                className="min-w-0 flex-1 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600 shadow-inner outline-none transition focus:border-zinc-600 focus:ring-2 focus:ring-zinc-500/25"
+                className="min-w-0 flex-1 rounded-lg border-2 border-zinc-500/50 bg-zinc-950 px-3 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-500 shadow-inner outline-none transition focus:border-zinc-400 focus:ring-2 focus:ring-zinc-400/35"
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
                 placeholder="Title, group, or URL (server filter, pauses ~½s after you type)…"
@@ -1546,10 +1606,10 @@ export function PlaylistOrganizer() {
           </div>
 
           <div className="pt-4">
-            <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">Playlist tools</p>
+            <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-400">Playlist tools</p>
             <div className="flex flex-col gap-3">
               <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-                <span className="hidden w-20 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-zinc-500 sm:block">
+                <span className="hidden w-20 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-zinc-400 sm:block">
                   Select
                 </span>
                 <div className={orgCluster}>
@@ -1573,11 +1633,11 @@ export function PlaylistOrganizer() {
                     Entire playlist
                   </button>
                   {selected.size > 0 ? (
-                    <span className="flex items-center rounded-lg bg-zinc-800/80 px-2.5 py-1.5 text-xs font-medium tabular-nums text-zinc-300">
+                    <span className="flex items-center rounded-lg bg-zinc-800/90 px-2.5 py-1.5 text-xs font-medium tabular-nums text-zinc-200">
                       {selected.size.toLocaleString()} selected
                     </span>
                   ) : null}
-                  <span className="hidden w-20 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-zinc-500 sm:block">
+                  <span className="hidden w-20 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-zinc-400 sm:block">
                     Order
                   </span>
                   <div className={orgCluster}>
@@ -1601,7 +1661,7 @@ export function PlaylistOrganizer() {
 
                 {groupedVisible.length > 0 ? (
                   <>
-                    <span className="hidden w-16 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-zinc-500 sm:block">
+                    <span className="hidden w-16 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-zinc-400 sm:block">
                       Groups
                     </span>
                     <div className={orgCluster}>
@@ -1617,7 +1677,7 @@ export function PlaylistOrganizer() {
 
                 {editorDataSet === "player" && rules && excludedCount > 0 ? (
                   <>
-                    <span className="hidden w-14 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-zinc-500 sm:block">
+                    <span className="hidden w-14 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-zinc-400 sm:block">
                       View
                     </span>
                     <div className={orgCluster}>
@@ -1638,7 +1698,7 @@ export function PlaylistOrganizer() {
               </div>
 
               <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-                <span className="hidden w-20 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-zinc-500 sm:block">
+                <span className="hidden w-20 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-zinc-400 sm:block">
                   Rules
                 </span>
                 <div className={`${orgCluster} flex-1 sm:flex-initial`}>
@@ -1701,17 +1761,21 @@ export function PlaylistOrganizer() {
                     >
                       Load all channels
                     </button>
-                    <span className="max-w-xs text-right text-[10px] text-zinc-500">
-                      Fetches each page from the server and appends rows until everything for this search and tab is shown.
-                    </span>
+                    <ExpandableHelp label="What “Load all channels” does" variant="compact" className="max-w-xs text-right">
+                      <p className="text-left">
+                        Fetches each page from the server and appends rows until everything for this search and tab is shown.
+                      </p>
+                    </ExpandableHelp>
                   </div>
                 ) : null}
               </div>
             </div>
-            <p className="mt-3 border-t border-zinc-800/80 pt-3 text-[11px] leading-relaxed text-zinc-600">
-              <span className="font-medium text-zinc-500">Reorder:</span> drag the six-dot handle on a group bar or on a channel row.
-              Group order and channel order live in your rules (auto-saved) — refresh the player file when you want the hosted M3U to match.
-            </p>
+            <ExpandableHelp label="Reorder & when changes hit your player" variant="compact" className="mt-3 border-t border-zinc-600/50 pt-3">
+              <p>
+                Drag the six-dot handle on a group bar or on a channel row. Group order and channel order live in your rules
+                (auto-saved) — refresh the player file when you want the hosted M3U to match.
+              </p>
+            </ExpandableHelp>
           </div>
         </div>
 
@@ -1723,10 +1787,10 @@ export function PlaylistOrganizer() {
             return (
               <article
                 key={group}
-                className="overflow-hidden rounded-2xl border border-zinc-800/90 bg-zinc-900/35 shadow-md shadow-black/20"
+                className="overflow-hidden rounded-2xl border-2 border-zinc-300/40 bg-zinc-900/88 shadow-xl shadow-black/30 ring-1 ring-zinc-950/35"
               >
                 <div
-                  className="flex flex-wrap items-center gap-3 border-b border-zinc-800/80 bg-gradient-to-r from-zinc-800/90 via-zinc-900/70 to-zinc-950/40 px-4 py-3"
+                  className="flex flex-wrap items-center gap-3 border-b-2 border-zinc-400/35 bg-gradient-to-r from-zinc-600 via-zinc-700 to-zinc-800 px-4 py-3"
                   onContextMenu={(e) => {
                     e.preventDefault();
                     const anchor = anchorRowForGroupContextMenu(gRows, group);
@@ -1754,7 +1818,7 @@ export function PlaylistOrganizer() {
                           title={expanded ? "Hide channels in this group" : "Show channels in this group"}
                           aria-expanded={expanded}
                           onClick={() => toggleGroupCollapsed(group)}
-                          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-zinc-700/80 bg-zinc-950/50 text-zinc-300 hover:border-zinc-600 hover:bg-zinc-800 hover:text-white"
+                          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-zinc-700/80 bg-zinc-900/50 text-zinc-300 hover:border-zinc-600 hover:bg-zinc-800 hover:text-white"
                         >
                           <svg
                             viewBox="0 0 20 20"
@@ -1783,7 +1847,7 @@ export function PlaylistOrganizer() {
                           onDragEnd={() => {
                             dragGroupRef.current = null;
                           }}
-                          className="inline-flex cursor-grab select-none items-center rounded-lg border border-zinc-700/60 bg-zinc-950/40 px-1.5 py-1.5 text-zinc-500 hover:border-zinc-600 hover:bg-zinc-800/60 hover:text-zinc-300 active:cursor-grabbing"
+                          className="inline-flex cursor-grab select-none items-center rounded-lg border border-zinc-700/60 bg-zinc-900/40 px-1.5 py-1.5 text-zinc-500 hover:border-zinc-600 hover:bg-zinc-800/60 hover:text-zinc-300 active:cursor-grabbing"
                         >
                           <DragGripIcon />
                         </span>
@@ -1796,7 +1860,7 @@ export function PlaylistOrganizer() {
                     >
                       {group}
                     </button>
-                    <span className="text-xs font-medium text-zinc-500">
+                    <span className="text-xs font-medium text-zinc-400">
                       {gRows.length.toLocaleString()} channel{gRows.length === 1 ? "" : "s"}
                     </span>
                   </div>
@@ -1813,33 +1877,34 @@ export function PlaylistOrganizer() {
                     dragGroupRef={dragGroupRef}
                   />
                 ) : (
-                  <p className="px-4 py-3 text-center text-xs text-zinc-600">Collapsed — use the arrow to show channels.</p>
+                  <p className="px-4 py-3 text-center text-xs text-zinc-400">Collapsed — use the arrow to show channels.</p>
                 )}
               </article>
             );
           })}
           {visible.length === 0 && !busy && !listLoading && (
-            <p className="rounded-2xl border border-zinc-800 bg-zinc-900/40 py-12 text-center text-sm text-zinc-500">
+            <p className="rounded-2xl border-2 border-dashed border-zinc-300/45 bg-zinc-700/80 py-12 text-center text-sm text-zinc-100 shadow-inner ring-1 ring-zinc-950/20">
               {editorDataSet === "rulesDropped" && total === 0
-                ? "No “hidden by rules” snapshot for this playlist yet. Run “Refresh player file from sources” once so the server can write it, or your rules may not have removed any channels on the last run."
+                ? "No “hidden by rules” snapshot for this playlist yet. Run “Full rebuild — all sources” once so the server can write it, or your rules may not have removed any channels on the last run."
                 : "No channels match this tab or search."}
             </p>
           )}
         </div>
 
-        <p className="text-xs text-zinc-600">
-          Use the group bar checkbox to select every channel in that group, or pick channels in the list. Use{" "}
-          <strong className="font-normal text-zinc-500">Move selected to top</strong> under Playlist tools (or right-click a channel
-          row) to move the whole selection to the top of each group. Right-click a channel row or <strong className="font-normal text-zinc-500">group bar</strong>{" "}
-          for filters, or use <strong className="font-normal text-zinc-500">Add a rule</strong> under Playlist tools. Drag the grip handle on a group or
-          channel to reorder; rules save automatically, then <strong className="font-normal text-zinc-500">refresh the player file</strong>{" "}
-          so the hosted M3U matches.
-          {editorDataSet === "player" && showExcluded
-            ? " With excluded rows visible, “Include selected again” adds name/URL allow patterns for the selection — refresh the player file when ready."
-            : editorDataSet === "rulesDropped"
-              ? " On “Hidden by rules”, select rows and use Include again to add allow patterns, or edit excludes under Add a rule — then refresh the player file so apps pick up changes."
-              : ""}
-        </p>
+        <ExpandableHelp label="Tips: selection, rules, and refresh" variant="compact">
+          <p>
+            Use the group bar checkbox to select every channel in that group, or pick channels in the list. Use{" "}
+            <strong>Move selected to top</strong> under Playlist tools (or right-click a channel row) to move the whole selection to
+            the top of each group. Right-click a channel row or <strong>group bar</strong> for filters, or use <strong>Add a rule</strong>{" "}
+            under Playlist tools. Drag the grip handle on a group or channel to reorder; rules save automatically, then{" "}
+            <strong>refresh the player file</strong> so the hosted M3U matches.
+            {editorDataSet === "player" && showExcluded
+              ? " With excluded rows visible, “Include selected again” adds name/URL allow patterns for the selection — refresh the player file when ready."
+              : editorDataSet === "rulesDropped"
+                ? " On “Hidden by rules”, select rows and use Include again to add allow patterns, or edit excludes under Add a rule — then refresh the player file so apps pick up changes."
+                : ""}
+          </p>
+        </ExpandableHelp>
         </div>
       </div>
 
@@ -1847,37 +1912,37 @@ export function PlaylistOrganizer() {
         <>
           <button type="button" className="fixed inset-0 z-30 cursor-default bg-black/40" aria-label="Close menu" onClick={() => setMenu(null)} />
           <div
-            className="fixed z-40 min-w-[200px] rounded-lg border border-zinc-700 bg-zinc-900 py-1 shadow-xl"
+            className="fixed z-40 min-w-[200px] rounded-lg border-2 border-zinc-300/50 bg-zinc-800 py-1 shadow-2xl ring-2 ring-black/30"
             style={{
               left: Math.max(8, Math.min(menu.x, (typeof window !== "undefined" ? window.innerWidth : 1200) - 216)),
               top: Math.max(8, Math.min(menu.y, (typeof window !== "undefined" ? window.innerHeight : 800) - 220)),
             }}
           >
             {menuIsMultiChannel ? (
-              <p className="border-b border-zinc-800 px-3 py-2 text-xs leading-snug text-zinc-300">
+              <p className="border-b border-zinc-600/50 px-3 py-2 text-xs leading-snug text-zinc-200">
                 {selected.size.toLocaleString()} channels selected — order applies to the whole selection.
               </p>
             ) : null}
             {!menuIsMultiChannel ? (
               <>
-                <p className="border-b border-zinc-800 px-3 py-1.5 text-xs text-zinc-500">Filter like this</p>
-                <button type="button" className="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-800" onClick={() => openFilterLike(menu.row, "name")}>
+                <p className="border-b border-zinc-600/50 px-3 py-1.5 text-xs text-zinc-400">Filter like this</p>
+                <button type="button" className="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-700" onClick={() => openFilterLike(menu.row, "name")}>
                   By channel title…
                 </button>
-                <button type="button" className="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-800" onClick={() => openFilterLike(menu.row, "group")}>
+                <button type="button" className="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-700" onClick={() => openFilterLike(menu.row, "group")}>
                   By group name…
                 </button>
-                <button type="button" className="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-800" onClick={() => openFilterLike(menu.row, "url")}>
+                <button type="button" className="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-700" onClick={() => openFilterLike(menu.row, "url")}>
                   By stream URL…
                 </button>
-                <div className="my-1 border-t border-zinc-800" />
+                <div className="my-1 border-t border-zinc-600/50" />
               </>
             ) : null}
             <p className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Order</p>
             {menu.scope === "group" ? (
               <button
                 type="button"
-                className="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-800"
+                className="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-700"
                 disabled={!rules}
                 onClick={() => moveGroupToTopFromMenu()}
               >
@@ -1886,7 +1951,7 @@ export function PlaylistOrganizer() {
             ) : (
               <button
                 type="button"
-                className="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-800"
+                className="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-700"
                 disabled={!rules}
                 onClick={() => moveChannelToTopFromMenu()}
               >
@@ -1900,23 +1965,24 @@ export function PlaylistOrganizer() {
       )}
 
       {filterModal && rules && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-3 sm:p-4">
-          <div className="max-h-[min(90dvh,calc(100svh-2rem))] w-full max-w-2xl overflow-y-auto overscroll-y-contain rounded-2xl border border-zinc-700 bg-zinc-900 shadow-2xl">
-            <div className="border-b border-zinc-800 px-4 py-4 sm:px-5">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/75 p-3 sm:p-4">
+          <div className="max-h-[min(90dvh,calc(100svh-2rem))] w-full max-w-2xl overflow-y-auto overscroll-y-contain rounded-2xl border-2 border-zinc-300/45 bg-zinc-800 shadow-2xl ring-2 ring-zinc-950/35">
+            <div className="border-b-2 border-zinc-400/40 px-4 py-4 sm:px-5">
               <h2 className="text-lg font-semibold text-white">
                 {filterModal.standalone ? "Add a playlist rule" : "Filter like this channel"}
               </h2>
-              <p className="mt-2 text-sm leading-relaxed text-zinc-400">
-                Choose whether matching channels should be <strong className="font-medium text-zinc-300">hidden</strong> or{" "}
-                <strong className="font-medium text-zinc-300">kept</strong>. The preview only looks at rows{" "}
-                <strong className="font-normal text-zinc-300">already loaded in this table</strong>; after rules sync to the server,
-                the same rule runs on the full list when you rebuild.
-              </p>
+              <ExpandableHelp label="How rules & preview interact" variant="compact" className="mt-2">
+                <p>
+                  Choose whether matching channels should be <strong>hidden</strong> or <strong>kept</strong>. The preview only looks
+                  at rows <strong>already loaded in this table</strong>; after rules sync to the server, the same rule runs on the full
+                  list when you rebuild.
+                </p>
+              </ExpandableHelp>
             </div>
             <div className="space-y-4 px-4 py-4 sm:px-5">
               {filterModal.standalone ? (
-                <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-3">
-                  <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">Match on</p>
+                <div className="rounded-xl border-2 border-zinc-300/35 bg-zinc-900/80 p-3 shadow-inner">
+                  <p className="text-xs font-medium uppercase tracking-wide text-zinc-400">Match on</p>
                   <p className="mt-1 text-xs text-zinc-500">Which part of each channel should this rule look at?</p>
                   <div className="mt-3 flex flex-wrap gap-2">
                     {(["name", "group", "url"] as const).map((f) => (
@@ -1927,7 +1993,7 @@ export function PlaylistOrganizer() {
                         className={`rounded-lg border px-3 py-2 text-sm font-medium ${
                           filterModal.field === f
                             ? "border-sky-500/70 bg-sky-500/15 text-sky-100"
-                            : "border-zinc-700 bg-zinc-950 text-zinc-400 hover:border-zinc-600 hover:text-zinc-200"
+                            : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:border-zinc-600 hover:text-zinc-200"
                         }`}
                       >
                         {fieldLabel(f)}
@@ -1936,8 +2002,8 @@ export function PlaylistOrganizer() {
                   </div>
                 </div>
               ) : (
-                <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-3">
-                  <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">From this row</p>
+                <div className="rounded-xl border-2 border-zinc-300/35 bg-zinc-900/80 p-3 shadow-inner">
+                  <p className="text-xs font-medium uppercase tracking-wide text-zinc-400">From this row</p>
                   <p className="mt-1 text-sm text-zinc-300">
                     <span className="text-zinc-500">{fieldLabel(filterModal.field)}:</span>{" "}
                     <span className="break-words text-white">
@@ -1956,7 +2022,7 @@ export function PlaylistOrganizer() {
                     className={`rounded-xl border px-4 py-3 text-left text-sm transition ${
                       filterModal.mode === "exclude"
                         ? "border-rose-500/70 bg-rose-500/15 text-rose-100 ring-1 ring-rose-500/40"
-                        : "border-zinc-700 bg-zinc-950/50 text-zinc-400 hover:border-zinc-600"
+                        : "border-zinc-700 bg-zinc-900/50 text-zinc-400 hover:border-zinc-600"
                     }`}
                   >
                     <span className="font-semibold text-white">Hide matching channels</span>
@@ -1968,7 +2034,7 @@ export function PlaylistOrganizer() {
                     className={`rounded-xl border px-4 py-3 text-left text-sm transition ${
                       filterModal.mode === "include"
                         ? "border-emerald-500/70 bg-emerald-500/15 text-emerald-100 ring-1 ring-emerald-500/40"
-                        : "border-zinc-700 bg-zinc-950/50 text-zinc-400 hover:border-zinc-600"
+                        : "border-zinc-700 bg-zinc-900/50 text-zinc-400 hover:border-zinc-600"
                     }`}
                   >
                     <span className="font-semibold text-white">Keep only matching channels</span>
@@ -1977,7 +2043,7 @@ export function PlaylistOrganizer() {
                 </div>
               </div>
 
-              <div className="flex rounded-lg border border-zinc-700 bg-zinc-950 p-1">
+              <div className="flex rounded-lg border-2 border-zinc-300/35 bg-zinc-950/70 p-1 shadow-inner">
                 <button
                   type="button"
                   onClick={() =>
@@ -1988,7 +2054,7 @@ export function PlaylistOrganizer() {
                     })
                   }
                   className={`flex-1 rounded-md px-3 py-2 text-sm font-medium ${
-                    filterModal.patternEditor === "simple" ? "bg-zinc-700 text-white shadow" : "text-zinc-400 hover:text-zinc-200"
+                    filterModal.patternEditor === "simple" ? "bg-zinc-600 text-white shadow" : "text-zinc-400 hover:text-zinc-200"
                   }`}
                 >
                   Simple
@@ -1997,7 +2063,7 @@ export function PlaylistOrganizer() {
                   type="button"
                   onClick={() => setFilterModal({ ...filterModal, patternEditor: "advanced" })}
                   className={`flex-1 rounded-md px-3 py-2 text-sm font-medium ${
-                    filterModal.patternEditor === "advanced" ? "bg-zinc-700 text-white shadow" : "text-zinc-400 hover:text-zinc-200"
+                    filterModal.patternEditor === "advanced" ? "bg-zinc-600 text-white shadow" : "text-zinc-400 hover:text-zinc-200"
                   }`}
                 >
                   Advanced pattern
@@ -2010,7 +2076,7 @@ export function PlaylistOrganizer() {
                     <span className="text-xs font-medium uppercase tracking-wide text-zinc-500">Text to match on</span>
                     <input
                       type="text"
-                      className="mt-1 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600"
+                      className="mt-1 w-full rounded-lg border-2 border-zinc-500/50 bg-zinc-950 px-3 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-500"
                       value={filterModal.simplePhrase}
                       placeholder="e.g. channel name, part of a URL, or one word"
                       onChange={(e) =>
@@ -2046,7 +2112,7 @@ export function PlaylistOrganizer() {
                           className={`rounded-xl border px-3 py-3 text-left transition ${
                             on
                               ? "border-sky-500/70 bg-sky-500/10 text-sky-100 ring-1 ring-sky-500/35"
-                              : "border-zinc-700 bg-zinc-950/60 hover:border-zinc-600"
+                              : "border-zinc-700 bg-zinc-900/60 hover:border-zinc-600"
                           }`}
                         >
                           <span className="text-sm font-semibold text-white">{opt.title}</span>
@@ -2060,7 +2126,7 @@ export function PlaylistOrganizer() {
                 <div className="space-y-2">
                   <label className="block text-xs font-medium uppercase tracking-wide text-zinc-500">Pattern (technical)</label>
                   <textarea
-                    className="h-24 w-full rounded-lg border border-zinc-700 bg-zinc-950 p-3 font-mono text-xs leading-relaxed text-zinc-200"
+                    className="h-24 w-full rounded-lg border-2 border-zinc-500/50 bg-zinc-950 p-3 font-mono text-xs leading-relaxed text-zinc-200"
                     value={filterModal.pattern}
                     spellCheck={false}
                     onChange={(e) => setFilterModal({ ...filterModal, pattern: e.target.value })}
@@ -2076,7 +2142,7 @@ export function PlaylistOrganizer() {
                 <p className="rounded-lg border border-rose-800/50 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">{filterPatternIssue}</p>
               ) : null}
 
-              <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-3">
+              <div className="rounded-xl border-2 border-zinc-300/35 bg-zinc-900/75 p-3 shadow-inner">
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
                   <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">Preview in this table</p>
                   <p className="text-sm text-zinc-300">
@@ -2084,14 +2150,14 @@ export function PlaylistOrganizer() {
                     <span className="text-zinc-500">loaded row{previewMatches.length === 1 ? "" : "s"} match</span>
                   </p>
                 </div>
-                <div className="mt-2 max-h-48 overflow-auto rounded-lg border border-zinc-800/80 bg-zinc-950 p-2 text-xs text-zinc-300">
+                <div className="mt-2 max-h-48 overflow-auto rounded-lg border-2 border-zinc-400/40 bg-zinc-950/80 p-2 text-xs text-zinc-200">
                   {filterPatternIssue ? (
                     <p className="py-4 text-center text-zinc-500">Fix the pattern to see matching channels here.</p>
                   ) : previewMatches.length === 0 ? (
                     <p className="py-4 text-center text-zinc-500">No loaded rows match yet — try another style or edit the text.</p>
                   ) : (
                     previewMatches.slice(0, 80).map((r) => (
-                      <div key={r.id} className="flex items-start gap-2 border-b border-zinc-800/60 py-2 last:border-0">
+                      <div key={r.id} className="flex items-start gap-2 border-b border-zinc-600/35 py-2 last:border-0">
                         <span className="mt-0.5 text-emerald-500" aria-hidden>
                           ✓
                         </span>
@@ -2113,7 +2179,7 @@ export function PlaylistOrganizer() {
                 </div>
               </div>
             </div>
-            <div className="flex flex-wrap justify-end gap-2 border-t border-zinc-800 px-4 py-4 sm:px-5">
+            <div className="flex flex-wrap justify-end gap-2 border-t border-zinc-600/50 px-4 py-4 sm:px-5">
               <button type="button" className="rounded-lg border border-zinc-600 px-4 py-2 text-sm" onClick={() => setFilterModal(null)}>
                 Cancel
               </button>
@@ -2131,7 +2197,7 @@ export function PlaylistOrganizer() {
       )}
 
       {toast && (
-        <div className="fixed bottom-[max(1.5rem,env(safe-area-inset-bottom,0px))] left-1/2 z-[60] max-w-[min(calc(100vw-1.5rem),28rem)] -translate-x-1/2 rounded-full border border-zinc-700 bg-zinc-900 px-4 py-3 text-center text-sm leading-snug shadow-xl sm:py-2">
+        <div className="fixed bottom-[max(1.5rem,env(safe-area-inset-bottom,0px))] left-1/2 z-[60] max-w-[min(calc(100vw-1.5rem),28rem)] -translate-x-1/2 rounded-full border-2 border-zinc-300/55 bg-zinc-600 px-4 py-3 text-center text-sm leading-snug text-white shadow-2xl shadow-black/40 ring-2 ring-white/25 sm:py-2">
           {toast}
         </div>
       )}
