@@ -895,42 +895,50 @@ export function PlaylistOrganizer() {
     notify("Group moved to top — refresh the player file when you want the hosted M3U to match.");
   }, [menu, rules, notify]);
 
-  const moveChannelToTopFromMenu = useCallback(() => {
-    if (!menu || !rules || menu.scope !== "channel") return;
-    const multi = selected.size > 1;
-    let headIds: string[];
-    if (multi) {
-      const seen = new Set<string>();
-      const ordered: string[] = [];
-      for (const { rows: gr } of groupedVisible) {
-        for (const row of gr) {
-          if (selected.has(row.id) && !seen.has(row.id)) {
-            seen.add(row.id);
-            ordered.push(row.id);
-          }
+  /** Reorder `channelOrder` so every selected id is moved to the front (visible-table order first, then remaining selected). */
+  const moveSelectedChannelsToTop = useCallback(() => {
+    if (!rules || selected.size === 0) return;
+    const seen = new Set<string>();
+    const ordered: string[] = [];
+    for (const { rows: gr } of groupedVisible) {
+      for (const row of gr) {
+        if (selected.has(row.id) && !seen.has(row.id)) {
+          seen.add(row.id);
+          ordered.push(row.id);
         }
       }
-      for (const id of selected) {
-        if (!seen.has(id)) {
-          seen.add(id);
-          ordered.push(id);
-        }
-      }
-      headIds = ordered;
-    } else {
-      headIds = [menu.row.id];
     }
-    const headSet = new Set(headIds);
+    for (const id of selected) {
+      if (!seen.has(id)) {
+        seen.add(id);
+        ordered.push(id);
+      }
+    }
+    const headSet = new Set(ordered);
     const rest = (rules.channelOrder ?? []).filter((x) => !headSet.has(x));
-    const merged = capChannelOrderList([...headIds, ...rest]);
+    const merged = capChannelOrderList([...ordered, ...rest]);
     setRules({ ...rules, channelOrder: merged });
-    setMenu(null);
     notify(
-      multi
-        ? `Moved ${headIds.length.toLocaleString()} channels to the top of each group — refresh the player file when you want the hosted M3U to match.`
+      ordered.length > 1
+        ? `Moved ${ordered.length.toLocaleString()} channels to the top of each group — refresh the player file when you want the hosted M3U to match.`
         : "Channel moved to top of its group — refresh the player file when you want the hosted M3U to match.",
     );
-  }, [menu, rules, notify, selected, groupedVisible]);
+  }, [rules, selected, groupedVisible, notify]);
+
+  const moveChannelToTopFromMenu = useCallback(() => {
+    if (!menu || !rules || menu.scope !== "channel") return;
+    if (selected.size > 1) {
+      moveSelectedChannelsToTop();
+    } else {
+      const headIds = [menu.row.id];
+      const headSet = new Set(headIds);
+      const rest = (rules.channelOrder ?? []).filter((x) => !headSet.has(x));
+      const merged = capChannelOrderList([...headIds, ...rest]);
+      setRules({ ...rules, channelOrder: merged });
+      notify("Channel moved to top of its group — refresh the player file when you want the hosted M3U to match.");
+    }
+    setMenu(null);
+  }, [menu, rules, moveSelectedChannelsToTop]);
 
   const toggleGroupRows = (gRows: EditorRow[]) => {
     const ids = gRows.map((r) => r.id);
@@ -1569,6 +1577,26 @@ export function PlaylistOrganizer() {
                       {selected.size.toLocaleString()} selected
                     </span>
                   ) : null}
+                  <span className="hidden w-20 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-zinc-500 sm:block">
+                    Order
+                  </span>
+                  <div className={orgCluster}>
+                    <button
+                      type="button"
+                      disabled={busy || !rules || selected.size === 0 || editorDataSet === "rulesDropped"}
+                      onClick={() => moveSelectedChannelsToTop()}
+                      title={
+                        editorDataSet === "rulesDropped"
+                          ? "Switch to “In player file” to reorder channels in the hosted M3U."
+                          : "Puts selected channels first in each group (same as the context menu). Rules save automatically — refresh the player file when you want the hosted M3U to match."
+                      }
+                      className={orgBtnOutline}
+                    >
+                      {selected.size > 1
+                        ? `Move ${selected.size.toLocaleString()} to top`
+                        : "Move selected to top"}
+                    </button>
+                  </div>
                 </div>
 
                 {groupedVisible.length > 0 ? (
@@ -1800,11 +1828,10 @@ export function PlaylistOrganizer() {
         </div>
 
         <p className="text-xs text-zinc-600">
-          Use the group bar checkbox to select every channel in that group, or pick channels in the list. With{" "}
-          <strong className="font-normal text-zinc-500">two or more</strong> rows checked, right-click any channel row for{" "}
-          <strong className="font-normal text-zinc-500">move whole selection to top</strong> only. Otherwise right-click a channel row
-          or <strong className="font-normal text-zinc-500">group bar</strong> for filters, order (move to top), or use{" "}
-          <strong className="font-normal text-zinc-500">Add a rule</strong> under Playlist tools. Drag the grip handle on a group or
+          Use the group bar checkbox to select every channel in that group, or pick channels in the list. Use{" "}
+          <strong className="font-normal text-zinc-500">Move selected to top</strong> under Playlist tools (or right-click a channel
+          row) to move the whole selection to the top of each group. Right-click a channel row or <strong className="font-normal text-zinc-500">group bar</strong>{" "}
+          for filters, or use <strong className="font-normal text-zinc-500">Add a rule</strong> under Playlist tools. Drag the grip handle on a group or
           channel to reorder; rules save automatically, then <strong className="font-normal text-zinc-500">refresh the player file</strong>{" "}
           so the hosted M3U matches.
           {editorDataSet === "player" && showExcluded
