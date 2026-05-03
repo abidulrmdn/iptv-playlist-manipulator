@@ -1,16 +1,35 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { Dispatch, MutableRefObject, SetStateAction } from "react";
-import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { onAuthStateChanged, signOut, type User } from "firebase/auth";
 import { doc, onSnapshot } from "firebase/firestore";
 import { auth, callable, db, publicPlaylistUrl } from "./firebase";
+import { hashEditorFilterKey } from "./editorFilterKey";
 import { formatRefreshProgressLine, type PlaylistRefreshProgress } from "./refreshProgressFormat";
 import { LIMITS, type PlaylistRules, type RulePatternTabScope } from "../../functions/src/constants";
 import { escapeRegExp } from "../../functions/src/excludeNamePatternChunks";
 import { applyRulesPreview, type PreviewChannel } from "./playlistRulesPreview";
 
 type EditorTab = "tv" | "movie" | "series";
+
+type EditorHydrationDoc = {
+  state: "idle" | "running" | "complete" | "failed";
+  dataSet: "player" | "rulesDropped";
+  filterKey: string;
+  indexedThrough: number;
+  chunkFilesWritten?: number;
+  filteredTotal?: number;
+  message?: string;
+};
+
+type EditorHydrationTickResult = {
+  state: string;
+  indexedThrough: number;
+  chunkFilesWritten: number;
+  filteredTotal?: number;
+  message?: string;
+};
 
 type EditorRow = {
   id: string;
@@ -117,6 +136,7 @@ function ChannelThumb({ row }: { row: EditorRow }) {
         decoding="async"
         referrerPolicy="no-referrer"
         className="h-11 w-11 shrink-0 rounded-lg border border-zinc-700/80 bg-zinc-950 object-cover"
+        onContextMenu={(e) => e.preventDefault()}
       />
     );
   }
@@ -132,6 +152,9 @@ function ChannelThumb({ row }: { row: EditorRow }) {
 
 /** Virtual row height hint; `measureElement` corrects per row after paint. */
 const CHANNEL_ROW_ESTIMATE_PX = 96;
+
+/** Server search debounce — long enough to avoid a callable per keystroke. */
+const EDITOR_SEARCH_DEBOUNCE_MS = 560;
 
 type VirtualGroupChannelListProps = {
   group: string;
@@ -159,7 +182,7 @@ function VirtualGroupChannelList({
     count: gRows.length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => CHANNEL_ROW_ESTIMATE_PX,
-    overscan: 10,
+    overscan: 5,
   });
 
   return (
@@ -177,7 +200,7 @@ function VirtualGroupChannelList({
                 selected.has(r.id) ? "bg-emerald-500/5 ring-1 ring-inset ring-emerald-500/25" : ""
               }`}
               style={{ transform: `translateY(${vi.start}px)` }}
-              onContextMenu={(e) => {
+              onContextMenuCapture={(e) => {
                 e.preventDefault();
                 setMenu({ x: e.clientX, y: e.clientY, row: r, scope: "channel", groupKey: group });
               }}
@@ -358,7 +381,10 @@ export function PlaylistOrganizer() {
   const { playlistId } = useParams<{ playlistId: string }>();
   const [user, setUser] = useState<User | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  /** Mutations / long user actions (rebuild, bulk exclude, select-all ids, load-all). */
   const [busy, setBusy] = useState(false);
+  /** Editor list fetch only — does not lock the rest of the UI so search/tab changes stay usable. */
+  const [listLoading, setListLoading] = useState(false);
 
   const [name, setName] = useState("");
   const [publicToken, setPublicToken] = useState("");
@@ -382,6 +408,9 @@ export function PlaylistOrganizer() {
     movie: number;
     series: number;
   } | null>(null);
+  const [editorHydrationDoc, setEditorHydrationDoc] = useState<EditorHydrationDoc | null>(null);
+  const [editorFilterKey, setEditorFilterKey] = useState("");
+  const editorHydrationPrevSigRef = useRef("");
   const editorFetchGen = useRef(0);
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
@@ -445,16 +474,35 @@ export function PlaylistOrganizer() {
       (snap) => {
         if (!snap.exists()) {
           setRefreshProgress(null);
+          setEditorHydrationDoc(null);
           return;
         }
-        const rp = snap.data()?.refreshProgress as unknown;
+        const row = snap.data();
+        const rp = row?.refreshProgress as unknown;
         if (rp && typeof rp === "object" && rp !== null && "channelsSoFar" in rp) {
           setRefreshProgress(rp as PlaylistRefreshProgress);
         } else {
           setRefreshProgress(null);
         }
+        const eh = row?.editorHydration as unknown;
+        if (
+          eh &&
+          typeof eh === "object" &&
+          eh !== null &&
+          typeof (eh as { state?: unknown }).state === "string" &&
+          typeof (eh as { filterKey?: unknown }).filterKey === "string" &&
+          typeof (eh as { dataSet?: unknown }).dataSet === "string" &&
+          typeof (eh as { indexedThrough?: unknown }).indexedThrough === "number"
+        ) {
+          setEditorHydrationDoc(eh as EditorHydrationDoc);
+        } else {
+          setEditorHydrationDoc(null);
+        }
       },
-      () => setRefreshProgress(null),
+      () => {
+        setRefreshProgress(null);
+        setEditorHydrationDoc(null);
+      },
     );
     return () => unsub();
   }, [playlistId, user]);
@@ -462,10 +510,55 @@ export function PlaylistOrganizer() {
   useEffect(() => {
     const next = q.trim().slice(0, LIMITS.MAX_EDITOR_SEARCH_CHARS);
     if (next === serverQuery) return;
-    const delay = next.length === 0 ? 0 : 320;
-    const t = window.setTimeout(() => setServerQuery(next), delay);
+    const delay = next.length === 0 ? 0 : EDITOR_SEARCH_DEBOUNCE_MS;
+    const t = window.setTimeout(() => {
+      startTransition(() => setServerQuery(next));
+    }, delay);
     return () => window.clearTimeout(t);
   }, [q, serverQuery]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const tabFilter = tab === "tv" || tab === "movie" || tab === "series" ? tab : "all";
+      const dataSet = editorDataSet === "rulesDropped" ? "rulesDropped" : "player";
+      const needle = serverQuery.trim().slice(0, LIMITS.MAX_EDITOR_SEARCH_CHARS).toLowerCase();
+      const k = await hashEditorFilterKey(dataSet, tabFilter, needle);
+      if (!cancelled) setEditorFilterKey(k);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [editorDataSet, tab, serverQuery]);
+
+  const editorHydrationRunningMatch = useMemo(() => {
+    const hyd = editorHydrationDoc;
+    const ds = editorDataSet === "rulesDropped" ? "rulesDropped" : "player";
+    return Boolean(
+      editorFilterKey &&
+        hyd &&
+        hyd.state === "running" &&
+        hyd.filterKey === editorFilterKey &&
+        hyd.dataSet === ds,
+    );
+  }, [editorHydrationDoc, editorFilterKey, editorDataSet]);
+
+  useEffect(() => {
+    if (!playlistId || !user || !editorFilterKey || !editorHydrationRunningMatch) return;
+    const ds = editorDataSet === "rulesDropped" ? "rulesDropped" : "player";
+    const tickPayload = {
+      playlistId,
+      dataSet: ds,
+      ...(serverQuery ? { search: serverQuery } : {}),
+      ...(tab !== "all" ? { tab } : {}),
+    };
+    const fn = callable<typeof tickPayload, EditorHydrationTickResult>("editorHydrationTick", { timeout: 120_000 });
+    void fn(tickPayload).catch(() => undefined);
+    const id = window.setInterval(() => {
+      void fn(tickPayload).catch(() => undefined);
+    }, 2800);
+    return () => window.clearInterval(id);
+  }, [playlistId, user, editorFilterKey, editorHydrationRunningMatch, editorDataSet, tab, serverQuery]);
 
   /** Fetches one page from offset 0 for the current tab/search/source, then shows it (no silent background paging). */
   const load = useCallback(async () => {
@@ -473,7 +566,7 @@ export function PlaylistOrganizer() {
     loadedThroughRef.current = 0;
     editorFetchGen.current += 1;
     const session = editorFetchGen.current;
-    setBusy(true);
+    setListLoading(true);
     try {
       rulesSaveGeneration.current += 1;
       const fn = callable<
@@ -524,19 +617,44 @@ export function PlaylistOrganizer() {
       startTransition(() => {
         setRows(d.channels);
       });
+      const tickFn = callable<
+        { playlistId: string; dataSet?: string; tab?: string; search?: string },
+        EditorHydrationTickResult
+      >("editorHydrationTick", { timeout: 120_000 });
+      void tickFn({
+        playlistId,
+        dataSet: editorDataSet === "rulesDropped" ? "rulesDropped" : "player",
+        ...(serverQuery ? { search: serverQuery } : {}),
+        ...(tab !== "all" ? { tab } : {}),
+      }).catch(() => undefined);
     } catch (e) {
       notify(errMsg(e));
     } finally {
-      if (session === editorFetchGen.current) setBusy(false);
+      if (session === editorFetchGen.current) setListLoading(false);
     }
   }, [playlistId, user, notify, editorDataSet, serverQuery, tab]);
+
+  useEffect(() => {
+    const hyd = editorHydrationDoc;
+    const ds = editorDataSet === "rulesDropped" ? "rulesDropped" : "player";
+    if (!hyd || !editorFilterKey || hyd.filterKey !== editorFilterKey || hyd.dataSet !== ds) {
+      editorHydrationPrevSigRef.current = "";
+      return;
+    }
+    const sig = `${hyd.filterKey}|${hyd.state}`;
+    const prev = editorHydrationPrevSigRef.current;
+    if (hyd.state === "complete" && prev === `${hyd.filterKey}|running`) {
+      void load();
+    }
+    editorHydrationPrevSigRef.current = sig;
+  }, [editorHydrationDoc, editorFilterKey, editorDataSet, load]);
 
   /** Fetches every remaining page from the current offset until the server reports no more rows. */
   const loadAllRemaining = useCallback(async () => {
     if (!playlistId || !user) return;
     editorFetchGen.current += 1;
     const snapshotGen = editorFetchGen.current;
-    setBusy(true);
+    setListLoading(true);
     const maxPages = Math.ceil(LIMITS.MAX_CHANNELS_PER_PLAYLIST / LIMITS.MAX_EDITOR_PAGE_SIZE) + 2;
     try {
       rulesSaveGeneration.current += 1;
@@ -620,7 +738,7 @@ export function PlaylistOrganizer() {
     } catch (e) {
       notify(errMsg(e));
     } finally {
-      if (editorFetchGen.current === snapshotGen) setBusy(false);
+      if (editorFetchGen.current === snapshotGen) setListLoading(false);
     }
   }, [playlistId, user, notify, editorDataSet, serverQuery, tab]);
 
@@ -628,20 +746,23 @@ export function PlaylistOrganizer() {
     if (user && playlistId) void load();
   }, [user, playlistId, load]);
 
+  /** Defer rules preview + grouping so typing, tabs, and fetches stay responsive with huge lists. */
+  const rowsForPreview = useDeferredValue(rows);
+
   const { tableSourceRows, excludedCount } = useMemo(() => {
     if (editorDataSet === "rulesDropped") {
-      return { tableSourceRows: rows, excludedCount: 0 };
+      return { tableSourceRows: rowsForPreview, excludedCount: 0 };
     }
-    if (!rules || rows.length === 0) {
-      return { tableSourceRows: rows, excludedCount: 0 };
+    if (!rules || rowsForPreview.length === 0) {
+      return { tableSourceRows: rowsForPreview, excludedCount: 0 };
     }
-    const keptRows = applyRulesPreview(rows.map(rowToPreviewEntry), rules);
+    const keptRows = applyRulesPreview(rowsForPreview.map(rowToPreviewEntry), rules);
     const keptIds = new Set(keptRows.map((e) => (e as RowEntry).__rowId));
-    const excluded = rows.filter((r) => !keptIds.has(r.id));
+    const excluded = rowsForPreview.filter((r) => !keptIds.has(r.id));
     const excludedCount = excluded.length;
-    const tableSourceRows = showExcluded ? excluded : rows.filter((r) => keptIds.has(r.id));
+    const tableSourceRows = showExcluded ? excluded : rowsForPreview.filter((r) => keptIds.has(r.id));
     return { tableSourceRows, excludedCount };
-  }, [rows, rules, showExcluded, editorDataSet]);
+  }, [rowsForPreview, rules, showExcluded, editorDataSet]);
 
   useEffect(() => {
     setSelected(new Set());
@@ -776,7 +897,7 @@ export function PlaylistOrganizer() {
 
   const moveChannelToTopFromMenu = useCallback(() => {
     if (!menu || !rules || menu.scope !== "channel") return;
-    const multi = selected.size > 1 && selected.has(menu.row.id);
+    const multi = selected.size > 1;
     let headIds: string[];
     if (multi) {
       const seen = new Set<string>();
@@ -1170,9 +1291,9 @@ export function PlaylistOrganizer() {
     return <p className="p-8 text-zinc-400">Missing playlist id.</p>;
   }
 
-  const menuIsMultiChannel = Boolean(
-    menu && menu.scope === "channel" && selected.size > 1 && selected.has(menu.row.id),
-  );
+  const menuIsMultiChannel = Boolean(menu && menu.scope === "channel" && selected.size > 1);
+  /** Firestore progress survives a browser reload — server refresh may still be running. */
+  const serverReportsRefreshInFlight = Boolean(refreshProgress);
 
   if (!user) {
     return (
@@ -1258,15 +1379,20 @@ export function PlaylistOrganizer() {
               <div className="flex w-full items-center gap-0.5">
                 <button
                   type="button"
-                  disabled={busy}
+                  disabled={busy || serverReportsRefreshInFlight}
                   onClick={() => void rebuildM3u()}
+                  title={
+                    serverReportsRefreshInFlight
+                      ? "The server is already rebuilding this playlist — wait for it to finish, or watch the status line below."
+                      : "Downloads fresh M3U from each saved source, merges them, applies your rules and order, then overwrites the hosted file behind your player URL."
+                  }
                   className="min-w-0 flex-1 rounded-lg bg-emerald-500 px-2 py-2.5 text-sm font-semibold leading-snug text-emerald-950 hover:bg-emerald-400 disabled:opacity-40"
                 >
-                  Refresh player file from sources
+                  {serverReportsRefreshInFlight ? "Continue loading…" : "Refresh player file from sources"}
                 </button>
-                <InlineHelp text="Downloads fresh M3U from each saved source, merges them, applies your rules and order, then overwrites the hosted file behind your player URL. Your app keeps the same URL; large lists can take several minutes." />
+                <InlineHelp text="Downloads fresh M3U from each saved source, merges them, applies your rules and order, then overwrites the hosted file behind your player URL. Your app keeps the same URL; large lists can take several minutes. If you reload the page while a refresh runs, this button shows “Continue loading…” until the server finishes." />
               </div>
-              {busy && refreshProgress ? (
+              {refreshProgress ? (
                 <p className="text-center text-xs leading-snug text-amber-200/90" aria-live="polite">
                   {formatRefreshProgressLine(refreshProgress)}
                 </p>
@@ -1325,6 +1451,20 @@ export function PlaylistOrganizer() {
             </button>
           ))}
           <span className="ml-auto text-xs text-zinc-500">
+            {listLoading ? <span className="mr-2 text-sky-400/90">Updating list…</span> : null}
+            {editorHydrationDoc &&
+            editorHydrationDoc.state === "running" &&
+            editorFilterKey &&
+            editorHydrationDoc.filterKey === editorFilterKey &&
+            editorHydrationDoc.dataSet === (editorDataSet === "rulesDropped" ? "rulesDropped" : "player") ? (
+              <span className="mr-2 text-zinc-400/90" aria-live="polite">
+                Indexing editor cache{" "}
+                {editorHydrationDoc.indexedThrough.toLocaleString()}
+                {typeof editorHydrationDoc.filteredTotal === "number"
+                  ? ` / ${editorHydrationDoc.filteredTotal.toLocaleString()}`
+                  : "…"}
+              </span>
+            ) : null}
             Loaded {rows.length.toLocaleString()} / {total.toLocaleString()}{" "}
             {editorDataSet === "rulesDropped" ? "hidden rows" : "rows"}
             {editorDataSet === "player" && excludedCount > 0 && !showExcluded ? ` · ${excludedCount} hidden by rules (preview)` : ""}
@@ -1389,7 +1529,7 @@ export function PlaylistOrganizer() {
                 className="min-w-0 flex-1 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600 shadow-inner outline-none transition focus:border-zinc-600 focus:ring-2 focus:ring-zinc-500/25"
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
-                placeholder="Title, group, or URL (server filter, debounced)…"
+                placeholder="Title, group, or URL (server filter, pauses ~½s after you type)…"
                 type="search"
                 autoComplete="off"
                 maxLength={LIMITS.MAX_EDITOR_SEARCH_CHARS}
@@ -1526,7 +1666,7 @@ export function PlaylistOrganizer() {
                   <div className="flex w-full flex-col items-end gap-1 sm:ml-auto sm:w-auto">
                     <button
                       type="button"
-                      disabled={busy}
+                      disabled={busy || listLoading}
                       onClick={() => void loadAllRemaining()}
                       title={`Fetches all remaining pages for the current category tab and search (up to ${LIMITS.MAX_CHANNELS_PER_PLAYLIST.toLocaleString()} channels in chunks of ${LIMITS.MAX_EDITOR_PAGE_SIZE.toLocaleString()}).`}
                       className={orgBtnSkySolid}
@@ -1547,7 +1687,7 @@ export function PlaylistOrganizer() {
           </div>
         </div>
 
-        <div className="space-y-3">
+        <div className="relative space-y-3" aria-busy={listLoading}>
           {groupedVisible.map(({ group, rows: gRows }) => {
             const allOn = gRows.length > 0 && gRows.every((r) => selected.has(r.id));
             const someOn = gRows.some((r) => selected.has(r.id)) && !allOn;
@@ -1650,7 +1790,7 @@ export function PlaylistOrganizer() {
               </article>
             );
           })}
-          {visible.length === 0 && !busy && (
+          {visible.length === 0 && !busy && !listLoading && (
             <p className="rounded-2xl border border-zinc-800 bg-zinc-900/40 py-12 text-center text-sm text-zinc-500">
               {editorDataSet === "rulesDropped" && total === 0
                 ? "No “hidden by rules” snapshot for this playlist yet. Run “Refresh player file from sources” once so the server can write it, or your rules may not have removed any channels on the last run."
@@ -1660,8 +1800,10 @@ export function PlaylistOrganizer() {
         </div>
 
         <p className="text-xs text-zinc-600">
-          Use the group bar checkbox to select every channel in that group, or pick channels in the list. Right-click a
-          channel row or <strong className="font-normal text-zinc-500">group bar</strong> for filters, order (move to top), or use{" "}
+          Use the group bar checkbox to select every channel in that group, or pick channels in the list. With{" "}
+          <strong className="font-normal text-zinc-500">two or more</strong> rows checked, right-click any channel row for{" "}
+          <strong className="font-normal text-zinc-500">move whole selection to top</strong> only. Otherwise right-click a channel row
+          or <strong className="font-normal text-zinc-500">group bar</strong> for filters, order (move to top), or use{" "}
           <strong className="font-normal text-zinc-500">Add a rule</strong> under Playlist tools. Drag the grip handle on a group or
           channel to reorder; rules save automatically, then <strong className="font-normal text-zinc-500">refresh the player file</strong>{" "}
           so the hosted M3U matches.
@@ -1679,8 +1821,16 @@ export function PlaylistOrganizer() {
           <button type="button" className="fixed inset-0 z-30 cursor-default bg-black/40" aria-label="Close menu" onClick={() => setMenu(null)} />
           <div
             className="fixed z-40 min-w-[200px] rounded-lg border border-zinc-700 bg-zinc-900 py-1 shadow-xl"
-            style={{ left: menu.x, top: menu.y }}
+            style={{
+              left: Math.max(8, Math.min(menu.x, (typeof window !== "undefined" ? window.innerWidth : 1200) - 216)),
+              top: Math.max(8, Math.min(menu.y, (typeof window !== "undefined" ? window.innerHeight : 800) - 220)),
+            }}
           >
+            {menuIsMultiChannel ? (
+              <p className="border-b border-zinc-800 px-3 py-2 text-xs leading-snug text-zinc-300">
+                {selected.size.toLocaleString()} channels selected — order applies to the whole selection.
+              </p>
+            ) : null}
             {!menuIsMultiChannel ? (
               <>
                 <p className="border-b border-zinc-800 px-3 py-1.5 text-xs text-zinc-500">Filter like this</p>

@@ -53,8 +53,19 @@ function splitExtinf(line: string): { duration: string; attrPart: string; title:
  * Parse M3U text into channel entries. Handles #EXTGRP before EXTINF blocks.
  */
 export function parseM3u(text: string): ChannelEntry[] {
+  return [...iterateM3uChannels(text)];
+}
+
+/**
+ * Stream-parse M3U without building a full in-memory array (for large playlists).
+ */
+export function forEachM3uChannel(text: string, fn: (ch: ChannelEntry) => void): void {
+  for (const ch of iterateM3uChannels(text)) fn(ch);
+}
+
+/** Memory-friendly iterator for large playlists (hydration / streaming). */
+export function* iterateM3uChannels(text: string): Generator<ChannelEntry> {
   const lines = text.split(/\r?\n/);
-  const entries: ChannelEntry[] = [];
   let pendingExtinf: string | null = null;
   let currentExtgrp: string | undefined;
 
@@ -75,7 +86,7 @@ export function parseM3u(text: string): ChannelEntry[] {
       if (parts) {
         const attrs = parseAttrString(parts.attrPart);
         const groupTitle = attrs.groupTitle ?? currentExtgrp;
-        entries.push({
+        yield {
           duration: parts.duration,
           title: parts.title,
           url: line,
@@ -86,12 +97,11 @@ export function parseM3u(text: string): ChannelEntry[] {
           groupTitle,
           urlTvg: attrs.urlTvg,
           extgrp: currentExtgrp,
-        });
+        };
       }
       pendingExtinf = null;
     }
   }
-  return entries;
 }
 
 function escapeAttrValue(v: string): string {

@@ -26,6 +26,9 @@ These limits match the **IPTV Middleware MVP** product requirement: *hard caps s
 | `SNAPSHOTS_RETAINED` | 3 | Rolling `playlist.snapshot-{n}.m3u` backups before each new write |
 | `MAX_EDITOR_PAGE_SIZE` | 6,000 | Callable `getPlaylistEditorData` page size |
 | `MAX_EDITOR_SEARCH_CHARS` | 200 | Max length of `search` argument on `getPlaylistEditorData` |
+| `EDITOR_HYDRATION_CHUNK_ROWS` | 10,000 | Rows per JSON part file under `editor-cache/{filterKey}/` in Storage |
+| `EDITOR_HYDRATION_TICK_MAX_FILTERED` | 18,000 | Max filtered channels processed per `editorHydrationTick` invocation |
+| `EDITOR_HYDRATION_PROGRESS_MIN_MS` | 1,800 | Min interval between Firestore `editorHydration` progress writes during a tick |
 
 ## Runtime (refresh)
 
@@ -42,7 +45,8 @@ These limits match the **IPTV Middleware MVP** product requirement: *hard caps s
 - `functions/src/index.ts` — `countUserSources` / `countUserPlaylists`, URL length, `createPlaylist` source checks.
 - `functions/src/refresh.ts` — `assertLimits`, M3U byte cap after merge, upstream `fetchM3u` timeout / retries.
 - `functions/src/xtream.ts` — Xtream HTTP caps, category fan-out, generated M3U size, optional `onProgress` for refresh UI.
-- `functions/src/index.ts` — clears `refreshProgress` when `refreshPlaylist` fails; scheduler catch path clears it too; `getPlaylistEditorData` search length cap and tab filter.
+- `functions/src/index.ts` — clears `refreshProgress` when `refreshPlaylist` fails; scheduler catch path clears it too; `getPlaylistEditorData` search length cap and tab filter; `editorHydrationTick` uses editor hydration caps.
+- `functions/src/editorHydration.ts` — `EDITOR_HYDRATION_*` caps for Storage chunking and Firestore progress throttling.
 
 ## TMDB
 

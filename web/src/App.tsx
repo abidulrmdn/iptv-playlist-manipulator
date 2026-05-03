@@ -158,6 +158,9 @@ export function App() {
   const [user, setUser] = useState<User | null>(null);
   const [email, setEmail] = useState("");
   const [busy, setBusy] = useState(false);
+  /** Long M3U refresh must not block Step 1 (add sources) — `busy` is only for shorter callables. */
+  const [playlistRefreshing, setPlaylistRefreshing] = useState(false);
+  const [sourceSubmitting, setSourceSubmitting] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [linkSent, setLinkSent] = useState(false);
   const [completingLink, setCompletingLink] = useState(false);
@@ -172,6 +175,11 @@ export function App() {
   const [xtBase, setXtBase] = useState("");
   const [xtUser, setXtUser] = useState("");
   const [xtPass, setXtPass] = useState("");
+  /** Password managers / autofill often skip `onChange`; refs capture real DOM values on submit. */
+  const srcUrlInputRef = useRef<HTMLInputElement>(null);
+  const xtBaseInputRef = useRef<HTMLInputElement>(null);
+  const xtUserInputRef = useRef<HTMLInputElement>(null);
+  const xtPassInputRef = useRef<HTMLInputElement>(null);
 
   const [plName, setPlName] = useState("My playlist");
   const [plSources, setPlSources] = useState<string[]>([]);
@@ -427,59 +435,70 @@ export function App() {
 
   const logout = () => signOut(auth);
 
-  const addSource = () =>
-    run(async () => {
-      const u = auth.currentUser;
-      if (!u) throw new Error("You are not signed in (or the session expired). Refresh the page and sign in again.");
-      await u.getIdToken();
-      const label = srcLabel.trim() || "Source";
-      const upsert = callable<
-        {
-          label: string;
-          sourceType?: string;
-          url?: string;
-          xtreamBaseUrl?: string;
-          xtreamUsername?: string;
-          xtreamPassword?: string;
-        },
-        { id: string }
-      >("upsertSource");
-      let kind: SourceRow["kind"] = "m3u";
-      let data: { id: string };
-      if (srcKind === "m3u") {
-        const url = srcUrl.trim();
-        if (!url) throw new Error("Enter a playlist URL");
-        const r = await upsert({ label, sourceType: "m3u", url });
-        data = r.data;
-        setSrcUrl("");
-        kind = "m3u";
-      } else {
-        if (!xtBase.trim()) throw new Error("Enter the Xtream server URL (e.g. http://panel.example:8080)");
-        if (!xtUser.trim()) throw new Error("Enter the Xtream username");
-        if (!xtPass.trim()) throw new Error("Enter the Xtream password");
-        const r = await upsert({
-          label,
-          sourceType: "xtream",
-          xtreamBaseUrl: xtBase.trim(),
-          xtreamUsername: xtUser.trim(),
-          xtreamPassword: xtPass,
+  const addSource = () => {
+    void (async () => {
+      setSourceSubmitting(true);
+      try {
+        const u = auth.currentUser;
+        if (!u) throw new Error("You are not signed in (or the session expired). Refresh the page and sign in again.");
+        await u.getIdToken();
+        const label = srcLabel.trim() || "Source";
+        const upsert = callable<
+          {
+            label: string;
+            sourceType?: string;
+            url?: string;
+            xtreamBaseUrl?: string;
+            xtreamUsername?: string;
+            xtreamPassword?: string;
+          },
+          { id: string }
+        >("upsertSource");
+        let kind: SourceRow["kind"] = "m3u";
+        let data: { id: string };
+        if (srcKind === "m3u") {
+          const url = (srcUrlInputRef.current?.value ?? srcUrl).trim();
+          if (!url) throw new Error("Enter a playlist URL");
+          const r = await upsert({ label, sourceType: "m3u", url });
+          data = r.data;
+          setSrcUrl("");
+          kind = "m3u";
+        } else {
+          const base = (xtBaseInputRef.current?.value ?? xtBase).trim();
+          const xtreamUser = (xtUserInputRef.current?.value ?? xtUser).trim();
+          const password = (xtPassInputRef.current?.value ?? xtPass).trim();
+          if (!base) throw new Error("Enter the Xtream server URL (e.g. http://panel.example:8080)");
+          if (!xtreamUser) throw new Error("Enter the Xtream username");
+          if (!password) throw new Error("Enter the Xtream password");
+          const r = await upsert({
+            label,
+            sourceType: "xtream",
+            xtreamBaseUrl: base,
+            xtreamUsername: xtreamUser,
+            xtreamPassword: password,
+          });
+          data = r.data;
+          setXtBase("");
+          setXtUser("");
+          setXtPass("");
+          kind = "xtream";
+        }
+        setSources((prev) => {
+          if (prev.some((s) => s.id === data.id)) return prev;
+          return [{ id: data.id, label, kind, createdAt: { seconds: Math.floor(Date.now() / 1000) } }, ...prev];
         });
-        data = r.data;
-        setXtBase("");
-        setXtUser("");
-        setXtPass("");
-        kind = "xtream";
+        notify(
+          kind === "xtream"
+            ? "Xtream source added (credentials encrypted server-side; refresh builds M3U from the API)"
+            : "Source added (URL encrypted server-side)",
+        );
+      } catch (e) {
+        notify(clientErrorMessage(e));
+      } finally {
+        setSourceSubmitting(false);
       }
-      setSources((prev) => {
-        if (prev.some((s) => s.id === data.id)) return prev;
-        return [{ id: data.id, label, kind, createdAt: { seconds: Math.floor(Date.now() / 1000) } }, ...prev];
-      });
-      notify(
-        kind === "xtream"
-          ? "Xtream source added (credentials encrypted server-side; refresh builds M3U from the API)"
-          : "Source added (URL encrypted server-side)",
-      );
-    });
+    })();
+  };
 
   const removeSource = (id: string) =>
     run(async () => {
@@ -508,16 +527,27 @@ export function App() {
       notify("Playlist created — open it and use “Refresh player file from sources” (or the same control in the editor) once to generate the hosted M3U.");
     });
 
-  const refreshPl = (id: string) =>
-    run(async () => {
-      if (!id) throw new Error("No playlist selected");
-      // Default callable timeout is 70s; refresh can take much longer (large M3Us + server limit 540s).
-      const fn = callable<{ playlistId: string }, { ok: boolean; channelCount: number }>("refreshPlaylist", {
-        timeout: 600_000,
-      });
-      await fn({ playlistId: id });
-      notify("Player file updated — your player URL now serves the new merged M3U.");
-    });
+  const refreshPl = (id: string) => {
+    void (async () => {
+      if (!id) {
+        notify(clientErrorMessage(new Error("No playlist selected")));
+        return;
+      }
+      setPlaylistRefreshing(true);
+      try {
+        // Default callable timeout is 70s; refresh can take much longer (large M3Us + server limit 540s).
+        const fn = callable<{ playlistId: string }, { ok: boolean; channelCount: number }>("refreshPlaylist", {
+          timeout: 600_000,
+        });
+        await fn({ playlistId: id });
+        notify("Player file updated — your player URL now serves the new merged M3U.");
+      } catch (e) {
+        notify(clientErrorMessage(e));
+      } finally {
+        setPlaylistRefreshing(false);
+      }
+    })();
+  };
 
   useEffect(() => {
     if (!selectedPl || !selected || selected.id !== selectedPl) return;
@@ -561,8 +591,8 @@ export function App() {
     return () => window.clearTimeout(t);
   }, [rulesJson, enrich, dupLatest, selectedPl, selected?.id, notify]);
 
-  const fetchDiff = (id: string) =>
-    run(async () => {
+  const fetchDiff = (id: string) => {
+    void (async () => {
       setDiffLoading(true);
       try {
         const fn = callable<{ playlistId: string }, { summary: unknown }>("getDiffSummary");
@@ -570,10 +600,13 @@ export function App() {
         const raw = r.data.summary;
         if (raw == null) setDiffSummary(null);
         else setDiffSummary(raw as DiffSummary);
+      } catch (e) {
+        notify(clientErrorMessage(e));
       } finally {
         setDiffLoading(false);
       }
-    });
+    })();
+  };
 
   const rotate = (id: string) =>
     run(async () => {
@@ -793,7 +826,7 @@ export function App() {
                       <div className="flex min-h-11 flex-wrap items-center gap-1">
                         <button
                           type="button"
-                          disabled={busy}
+                          disabled={busy || playlistRefreshing}
                           onClick={() => refreshPl(selected.id)}
                           className="rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-40"
                         >
@@ -801,7 +834,7 @@ export function App() {
                         </button>
                         <InlineHelp text="Downloads fresh M3U from each saved source, merges them, applies your rules and order, then overwrites the hosted file behind your player URL. Your app keeps the same URL and sees new channels after this finishes." />
                       </div>
-                      {busy && selected.refreshProgress ? (
+                      {playlistRefreshing && selected.refreshProgress ? (
                         <p className="w-full text-sm text-amber-200/90" aria-live="polite">
                           {formatRefreshProgressLine(selected.refreshProgress)}
                         </p>
@@ -809,7 +842,7 @@ export function App() {
                       <div className="flex min-h-11 flex-wrap items-center gap-1">
                         <button
                           type="button"
-                          disabled={busy || diffLoading}
+                          disabled={diffLoading || playlistRefreshing}
                           onClick={() => fetchDiff(selected.id)}
                           className="rounded-lg border border-zinc-600 px-4 py-2.5 text-sm hover:bg-zinc-800 disabled:opacity-40"
                         >
@@ -923,7 +956,7 @@ export function App() {
                   <div className="flex flex-wrap gap-2 border-t border-zinc-800 pt-4">
                     <button
                       type="button"
-                      disabled={busy}
+                      disabled={busy || playlistRefreshing}
                       onClick={() => rotate(selected.id)}
                       className="min-h-10 w-full rounded-lg border border-amber-800/50 px-3 py-2.5 text-left text-sm text-amber-200 hover:bg-amber-500/10 disabled:opacity-40 sm:w-auto sm:py-1.5"
                     >
@@ -931,7 +964,7 @@ export function App() {
                     </button>
                     <button
                       type="button"
-                      disabled={busy}
+                      disabled={busy || playlistRefreshing}
                       onClick={() => removePl(selected.id)}
                       className="min-h-10 w-full rounded-lg border border-red-800/60 px-3 py-2.5 text-left text-sm text-red-300 hover:bg-red-500/10 disabled:opacity-40 sm:w-auto sm:py-1.5"
                     >
@@ -994,34 +1027,42 @@ export function App() {
               />
               {srcKind === "m3u" ? (
                 <input
+                  ref={srcUrlInputRef}
                   placeholder="https://…/playlist.m3u"
                   className="min-h-11 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm sm:min-h-0 sm:py-2"
                   value={srcUrl}
                   onChange={(e) => setSrcUrl(e.target.value)}
+                  onInput={(e) => setSrcUrl(e.currentTarget.value)}
                 />
               ) : (
                 <>
                   <input
+                    ref={xtBaseInputRef}
                     placeholder="Server URL (e.g. http://panel.example.com or http://host:8080)"
                     className="min-h-11 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm sm:min-h-0 sm:py-2"
                     value={xtBase}
                     onChange={(e) => setXtBase(e.target.value)}
+                    onInput={(e) => setXtBase(e.currentTarget.value)}
                     autoComplete="off"
                   />
                   <input
+                    ref={xtUserInputRef}
                     placeholder="Username"
                     className="min-h-11 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm sm:min-h-0 sm:py-2"
                     value={xtUser}
                     onChange={(e) => setXtUser(e.target.value)}
-                    autoComplete="off"
+                    onInput={(e) => setXtUser(e.currentTarget.value)}
+                    autoComplete="username"
                   />
                   <input
+                    ref={xtPassInputRef}
                     placeholder="Password"
                     type="password"
                     className="min-h-11 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm sm:min-h-0 sm:py-2"
                     value={xtPass}
                     onChange={(e) => setXtPass(e.target.value)}
-                    autoComplete="new-password"
+                    onInput={(e) => setXtPass(e.currentTarget.value)}
+                    autoComplete="current-password"
                   />
                   <p className="text-xs text-zinc-500">
                     Use the same host you would put in an IPTV app for Xtream API (not the long M3U link). Live + VOD
@@ -1031,10 +1072,7 @@ export function App() {
               )}
               <button
                 type="button"
-                disabled={
-                  busy ||
-                  (srcKind === "m3u" ? !srcUrl.trim() : !xtBase.trim() || !xtUser.trim() || !xtPass.trim())
-                }
+                disabled={sourceSubmitting}
                 onClick={addSource}
                 className="min-h-11 w-full rounded-lg bg-emerald-500 py-3 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-40 sm:py-2"
               >
@@ -1102,7 +1140,7 @@ export function App() {
             </div>
             <button
               type="button"
-              disabled={busy || plSources.length === 0}
+              disabled={busy || playlistRefreshing || plSources.length === 0}
               onClick={createPl}
               className="mt-4 min-h-11 w-full rounded-lg border border-emerald-700/60 bg-emerald-500/10 py-3 text-sm font-semibold text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-40 sm:py-2"
             >

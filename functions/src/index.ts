@@ -12,6 +12,12 @@ import { setGlobalOptions } from "firebase-functions/v2/options";
 import { decryptUtf8, encryptUtf8 } from "./crypto.js";
 import { DEFAULT_RULES, LIMITS } from "./constants.js";
 import { classifyEditorTab } from "./editorTab.js";
+import {
+  editorHydrationTick as runEditorHydrationTickImpl,
+  hashEditorFilterKey,
+  tryReadEditorRowsFromCache,
+  type EditorHydrationState,
+} from "./editorHydration.js";
 import { buildExcludeNamePatternsFromTitles } from "./excludeNamePatternChunks.js";
 import { canonicalId, parseM3u } from "./m3u.js";
 import { mergePlaylistRules } from "./rules.js";
@@ -392,9 +398,11 @@ export const getPlaylistEditorData = onCall(
     enrichEnabled?: boolean;
     duplicateNewIntoLatest?: boolean;
     etag?: string;
+    editorHydration?: EditorHydrationState;
   };
 
   const enrichEnabled = Boolean(data.enrichEnabled);
+  const filterKey = hashEditorFilterKey(dataSet, tabFilter, searchNeedle);
 
   const objectPath =
     dataSet === "rulesDropped"
@@ -425,6 +433,42 @@ export const getPlaylistEditorData = onCall(
       "failed-precondition",
       "No generated playlist file yet. On the main app, run “Refresh player file from sources” once first.",
     );
+  }
+
+  const hyd = data.editorHydration;
+  if (hyd?.state === "complete" && hyd.filterKey === filterKey && hyd.m3uGeneration) {
+    const [srcMeta] = await file.getMetadata();
+    const m3uGeneration = String(srcMeta.generation ?? "");
+    if (hyd.m3uGeneration === m3uGeneration) {
+      const cached = await tryReadEditorRowsFromCache({
+        bucket,
+        uid,
+        playlistId,
+        filterKey,
+        m3uGeneration,
+        offset,
+        limit,
+      });
+      if (cached) {
+        const channels = cached.rows;
+        return {
+          name: data.name ?? "Playlist",
+          publicToken: data.publicToken ?? "",
+          rules: mergePlaylistRules(data.rules),
+          channels,
+          total: cached.total,
+          offset,
+          limit,
+          hasMore: offset + channels.length < cached.total,
+          etag: data.etag ?? "",
+          enrichEnabled,
+          duplicateNewIntoLatest: data.duplicateNewIntoLatest !== false,
+          dataSet,
+          rulesDroppedAvailable: dataSet === "rulesDropped" ? true : undefined,
+          totalsByTab: cached.fileTotalsByTab,
+        };
+      }
+    }
   }
 
   const [buf] = await file.download();
@@ -487,6 +531,44 @@ export const getPlaylistEditorData = onCall(
     totalsByTab,
   };
 });
+
+/** Advances server-side editor cache hydration (Storage chunks + `editorHydration` on the playlist doc). */
+export const editorHydrationTick = onCall(
+  { ...RUN_INVOKER_PUBLIC, memory: "512MiB", timeoutSeconds: 120 },
+  async (request) => {
+    requireAuth(request.auth?.uid);
+    const uid = request.auth!.uid;
+    const playlistId = String(request.data?.playlistId ?? "");
+    if (!playlistId) throw new HttpsError("invalid-argument", "Missing playlistId");
+    const dataSetRaw = String((request.data as { dataSet?: unknown })?.dataSet ?? "player").trim().toLowerCase();
+    const dataSet = dataSetRaw === "rulesdropped" || dataSetRaw === "rules_dropped" ? "rulesDropped" : "player";
+    const tabRaw = String((request.data as { tab?: unknown })?.tab ?? "all").trim().toLowerCase();
+    const tabFilter = tabRaw === "tv" || tabRaw === "movie" || tabRaw === "series" ? tabRaw : "all";
+    const searchRaw = String((request.data as { search?: unknown })?.search ?? "").trim();
+    const searchNeedle = searchRaw.slice(0, LIMITS.MAX_EDITOR_SEARCH_CHARS).toLowerCase();
+
+    const snap = await db.collection("playlists").doc(playlistId).get();
+    if (!snap.exists || (snap.data() as { ownerUid?: string }).ownerUid !== uid) {
+      throw new HttpsError("not-found", "Playlist not found");
+    }
+
+    try {
+      return await runEditorHydrationTickImpl({
+        db,
+        bucket,
+        uid,
+        playlistId,
+        dataSet,
+        tabFilter,
+        searchNeedle,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg === "not-found") throw new HttpsError("not-found", "Playlist not found");
+      throw e;
+    }
+  },
+);
 
 /** All canonical channel ids for the organizer “select entire playlist” action (auth; re-reads Storage M3U). */
 export const getPlaylistEditorChannelIds = onCall(

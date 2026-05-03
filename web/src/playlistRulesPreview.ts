@@ -128,7 +128,13 @@ export function applyRulesPreview<T extends PreviewChannel>(entries: T[], rules:
     const g = applyGroupRenames(rules, out[i].groupTitle);
     out[i] = { ...out[i], groupTitle: g };
   }
-  const afterRename = out.map((e) => ({ ...e }));
+
+  const allowN = rules.allowNamePatterns;
+  const allowU = rules.allowUrlPatterns;
+  const allowG = rules.allowGroupPatterns;
+  const needsAllowRescue = allowN.length > 0 || allowU.length > 0 || allowG.length > 0;
+  /** Post-rename full list before filters — only built when allow-rules may rescue rows. */
+  const afterRename = needsAllowRescue ? out.map((e) => ({ ...e })) : [];
 
   if (rules.includeGroupPatterns.length > 0) {
     const scopes = rules.includeGroupPatternScopes;
@@ -164,13 +170,10 @@ export function applyRulesPreview<T extends PreviewChannel>(entries: T[], rules:
 
   sortPreviewByRules(out, rules);
 
-  const allowN = rules.allowNamePatterns;
-  const allowU = rules.allowUrlPatterns;
-  const allowG = rules.allowGroupPatterns;
   const allowNS = rules.allowNamePatternScopes;
   const allowUS = rules.allowUrlPatternScopes;
   const allowGS = rules.allowGroupPatternScopes;
-  if (allowN.length > 0 || allowU.length > 0 || allowG.length > 0) {
+  if (needsAllowRescue) {
     const keyFn = (ch: T) =>
       rules.dedupeBy === "name" ? ch.title.trim().toLowerCase() : ch.url.trim();
     const inOut = new Set(out.map(keyFn));

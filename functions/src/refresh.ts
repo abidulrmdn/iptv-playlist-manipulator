@@ -8,6 +8,7 @@ import { LIMITS, type PlaylistRules } from "./constants.js";
 import { mergePlaylistRules, partitionRulesKeptDropped } from "./rules.js";
 import { canonicalId, parseM3u, serializeM3u, type ChannelEntry } from "./m3u.js";
 import { enrichWithTmdb } from "./enrich.js";
+import { invalidateEditorHydrationCache } from "./editorHydration.js";
 
 export type SourceDoc = {
   ownerUid: string;
@@ -708,6 +709,8 @@ export async function runPlaylistRefresh(params: {
       storagePath: mainPath,
       nextScheduledRefreshAt: nextDue,
     });
+
+  await invalidateEditorHydrationCache(db, bucket, ownerUid, playlistId);
 
   return { channelCount: finalChannels.length, etag };
 }

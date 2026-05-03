@@ -71,6 +71,12 @@ export const LIMITS = {
   MAX_EDITOR_PAGE_SIZE: 6_000,
   /** Max characters accepted for `getPlaylistEditorData` substring search (cost / abuse). */
   MAX_EDITOR_SEARCH_CHARS: 200,
+  /** Rows per JSON chunk file for editor hydration cache (Storage). */
+  EDITOR_HYDRATION_CHUNK_ROWS: 10_000,
+  /** Max filtered channels processed per `editorHydrationTick` (wall time + work cap). */
+  EDITOR_HYDRATION_TICK_MAX_FILTERED: 18_000,
+  /** Min interval between Firestore `editorHydration` progress writes during a tick. */
+  EDITOR_HYDRATION_PROGRESS_MIN_MS: 1_800,
   /** Cap stored manual channel ordering (Firestore size / UX). */
   MAX_CHANNEL_ORDER_ENTRIES: 10_000,
 } as const;
