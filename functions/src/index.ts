@@ -335,7 +335,11 @@ export const refreshPlaylist = onCall(
       await db
         .collection("playlists")
         .doc(playlistId)
-        .update({ lastError: msg, updatedAt: FieldValue.serverTimestamp() })
+        .update({
+          lastError: msg,
+          refreshProgress: FieldValue.delete(),
+          updatedAt: FieldValue.serverTimestamp(),
+        })
         .catch(() => undefined);
       // Use failed-precondition so the client surfaces `message` instead of a generic internal code.
       throw new HttpsError("failed-precondition", msg);
@@ -370,6 +374,8 @@ export const getPlaylistEditorData = onCall(
   const offset = Math.max(0, Math.floor(Number((request.data as { offset?: unknown })?.offset ?? 0)));
   const limitRaw = Math.floor(Number((request.data as { limit?: unknown })?.limit ?? LIMITS.MAX_EDITOR_PAGE_SIZE));
   const limit = Math.min(LIMITS.MAX_EDITOR_PAGE_SIZE, Math.max(50, limitRaw));
+  const dataSetRaw = String((request.data as { dataSet?: unknown })?.dataSet ?? "player").trim().toLowerCase();
+  const dataSet = dataSetRaw === "rulesdropped" || dataSetRaw === "rules_dropped" ? "rulesDropped" : "player";
 
   const snap = await db.collection("playlists").doc(playlistId).get();
   if (!snap.exists || (snap.data() as { ownerUid?: string }).ownerUid !== uid) {
@@ -384,13 +390,35 @@ export const getPlaylistEditorData = onCall(
     etag?: string;
   };
 
-  const objectPath = `users/${uid}/playlists/${playlistId}/playlist.m3u`;
+  const enrichEnabled = Boolean(data.enrichEnabled);
+
+  const objectPath =
+    dataSet === "rulesDropped"
+      ? `users/${uid}/playlists/${playlistId}/playlist.editor-rules-dropped.m3u`
+      : `users/${uid}/playlists/${playlistId}/playlist.m3u`;
   const file = bucket.file(objectPath);
   const [exists] = await file.exists();
   if (!exists) {
+    if (dataSet === "rulesDropped") {
+      return {
+        name: data.name ?? "Playlist",
+        publicToken: data.publicToken ?? "",
+        rules: mergePlaylistRules(data.rules),
+        channels: [],
+        total: 0,
+        offset: 0,
+        limit,
+        hasMore: false,
+        etag: data.etag ?? "",
+        enrichEnabled,
+        duplicateNewIntoLatest: data.duplicateNewIntoLatest !== false,
+        dataSet: "rulesDropped",
+        rulesDroppedAvailable: false,
+      };
+    }
     throw new HttpsError(
       "failed-precondition",
-      "No generated playlist file yet. On the main app, run “Rebuild M3U for player” once first.",
+      "No generated playlist file yet. On the main app, run “Refresh player file from sources” once first.",
     );
   }
 
@@ -403,7 +431,6 @@ export const getPlaylistEditorData = onCall(
   const all = parseM3u(text);
   const total = all.length;
   const slice = all.slice(offset, offset + limit);
-  const enrichEnabled = Boolean(data.enrichEnabled);
 
   const channels = slice.map((ch) => ({
     id: canonicalId(ch),
@@ -427,6 +454,8 @@ export const getPlaylistEditorData = onCall(
     etag: data.etag ?? "",
     enrichEnabled,
     duplicateNewIntoLatest: data.duplicateNewIntoLatest !== false,
+    dataSet,
+    rulesDroppedAvailable: dataSet === "rulesDropped" ? true : undefined,
   };
 });
 
@@ -450,7 +479,7 @@ export const getPlaylistEditorChannelIds = onCall(
   if (!exists) {
     throw new HttpsError(
       "failed-precondition",
-      "No generated playlist file yet. On the main app, run “Rebuild M3U for player” once first.",
+      "No generated playlist file yet. On the main app, run “Refresh player file from sources” once first.",
     );
   }
 
@@ -498,7 +527,7 @@ export const bulkExcludeByNamesForChannelIds = onCall(
   if (!exists) {
     throw new HttpsError(
       "failed-precondition",
-      "No generated playlist file yet. On the main app, run “Rebuild M3U for player” once first.",
+      "No generated playlist file yet. On the main app, run “Refresh player file from sources” once first.",
     );
   }
 
@@ -541,14 +570,18 @@ export const bulkExcludeByNamesForChannelIds = onCall(
   const data = snap.data() as { rules?: unknown };
   const rules = mergePlaylistRules(data.rules);
   const arr = [...rules.excludeNamePatterns];
+  const excludeNamePatternScopes = [...rules.excludeNamePatternScopes];
+  while (excludeNamePatternScopes.length < arr.length) excludeNamePatternScopes.push("all");
+  excludeNamePatternScopes.length = arr.length;
   let added = 0;
   for (const p of newPatterns) {
     if (!arr.includes(p)) {
       arr.push(p);
+      excludeNamePatternScopes.push("all");
       added++;
     }
   }
-  const nextRules = { ...rules, excludeNamePatterns: arr };
+  const nextRules = { ...rules, excludeNamePatterns: arr, excludeNamePatternScopes };
   try {
     await ref.update({ rules: nextRules, updatedAt: FieldValue.serverTimestamp() });
   } catch (e: unknown) {
@@ -654,7 +687,13 @@ export const scheduledPlaylistRefresh = onSchedule(
           tmdbApiKey: tmdb || undefined,
         });
       } catch {
-        await doc.ref.update({ lastError: "Scheduled refresh failed", updatedAt: FieldValue.serverTimestamp() }).catch(() => undefined);
+        await doc.ref
+          .update({
+            lastError: "Scheduled refresh failed",
+            refreshProgress: FieldValue.delete(),
+            updatedAt: FieldValue.serverTimestamp(),
+          })
+          .catch(() => undefined);
       }
     }
   },

@@ -17,6 +17,7 @@ import {
   getEmailLinkContinueUrl,
   publicPlaylistUrl,
 } from "./firebase";
+import { formatRefreshProgressLine, type PlaylistRefreshProgress } from "./refreshProgressFormat";
 
 const DEV_TEST_EMAIL = "test@test.com";
 
@@ -45,6 +46,20 @@ function formatFunctionsDetails(details: unknown): string | undefined {
     if (parts.length) return parts.join(" · ");
   }
   return undefined;
+}
+
+/** Native tooltip for short explanations next to actions (hover or long-press on touch). */
+function InlineHelp({ text }: { text: string }) {
+  return (
+    <span
+      className="ml-1 inline-flex h-5 w-5 shrink-0 cursor-help select-none items-center justify-center rounded-full border border-zinc-600 text-[10px] font-bold text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
+      title={text}
+      role="img"
+      aria-label={text}
+    >
+      ?
+    </span>
+  );
 }
 
 function formatFunctionsCustomData(customData: unknown): string | undefined {
@@ -95,6 +110,7 @@ type PlaylistRow = {
   etag?: string;
   lastError?: string;
   lastSuccessAt?: { seconds?: number };
+  refreshProgress?: PlaylistRefreshProgress;
 };
 
 /** Written by the server after each successful rebuild; used for “what changed” in the UI. */
@@ -111,14 +127,23 @@ const defaultRulesJson = JSON.stringify(
     dedupe: true,
     dedupeBy: "url",
     includeGroupPatterns: [] as string[],
+    includeGroupPatternScopes: [] as ("all" | "tv" | "movie" | "series")[],
     excludeGroupPatterns: [] as string[],
+    excludeGroupPatternScopes: [] as ("all" | "tv" | "movie" | "series")[],
     includeNamePatterns: [] as string[],
+    includeNamePatternScopes: [] as ("all" | "tv" | "movie" | "series")[],
     excludeNamePatterns: [] as string[],
+    excludeNamePatternScopes: [] as ("all" | "tv" | "movie" | "series")[],
     includeUrlPatterns: [] as string[],
+    includeUrlPatternScopes: [] as ("all" | "tv" | "movie" | "series")[],
     excludeUrlPatterns: [] as string[],
+    excludeUrlPatternScopes: [] as ("all" | "tv" | "movie" | "series")[],
     allowNamePatterns: [] as string[],
+    allowNamePatternScopes: [] as ("all" | "tv" | "movie" | "series")[],
     allowUrlPatterns: [] as string[],
+    allowUrlPatternScopes: [] as ("all" | "tv" | "movie" | "series")[],
     allowGroupPatterns: [] as string[],
+    allowGroupPatternScopes: [] as ("all" | "tv" | "movie" | "series")[],
     groupRenames: [] as { pattern: string; replacement: string }[],
     groupOrder: [] as string[],
     channelOrder: [] as string[],
@@ -294,8 +319,16 @@ export function App() {
       (snap) => {
         setPlaylists(
           snap.docs.map((d) => {
-            const x = d.data() as Omit<PlaylistRow, "id">;
-            return { id: d.id, ...x };
+            const x = d.data() as Omit<PlaylistRow, "id"> & { refreshProgress?: unknown };
+            const refreshProgress =
+              x.refreshProgress &&
+              typeof x.refreshProgress === "object" &&
+              x.refreshProgress !== null &&
+              "channelsSoFar" in x.refreshProgress
+                ? (x.refreshProgress as PlaylistRefreshProgress)
+                : undefined;
+            const { refreshProgress: _rp, ...rest } = x;
+            return { id: d.id, ...rest, refreshProgress };
           }),
         );
       },
@@ -472,7 +505,7 @@ export function App() {
         duplicateNewIntoLatest: true,
       });
       setSelectedPl(id);
-      notify("Playlist created — open it and tap Rebuild M3U for player to generate the file your IPTV app will use");
+      notify("Playlist created — open it and use “Refresh player file from sources” (or the same control in the editor) once to generate the hosted M3U.");
     });
 
   const refreshPl = (id: string) =>
@@ -483,7 +516,7 @@ export function App() {
         timeout: 600_000,
       });
       await fn({ playlistId: id });
-      notify("Rebuild finished — your player URL now serves the new merged M3U.");
+      notify("Player file updated — your player URL now serves the new merged M3U.");
     });
 
   useEffect(() => {
@@ -661,9 +694,9 @@ export function App() {
           <p className="font-medium text-zinc-100">How this screen is laid out</p>
           <ul className="mt-3 list-inside list-disc space-y-2 text-zinc-400 marker:text-zinc-600">
             <li>
-              <span className="text-zinc-200">Top — your output playlists:</span> pick a hosted playlist,{" "}
-              <span className="text-zinc-200">Rebuild M3U for player</span> when you want fresh data, and copy the{" "}
-              <strong className="font-normal text-zinc-300">player URL</strong> for your IPTV app.
+              <span className="text-zinc-200">Top — your output playlists:</span> pick a hosted playlist, use{" "}
+              <span className="text-zinc-200">Refresh player file from sources</span> when you want the server to pull fresh
+              provider data, and copy the <strong className="font-normal text-zinc-300">player URL</strong> for your IPTV app.
             </li>
             <li>
               <span className="text-zinc-200">Below that — Step 1 (left):</span> paste each provider’s{" "}
@@ -722,47 +755,14 @@ export function App() {
             {selected && (
               <div className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-4 sm:p-5">
                 <div className="space-y-5">
-                  <div className="rounded-lg border border-zinc-800/80 bg-zinc-900/70 p-3 text-sm leading-relaxed text-zinc-400">
-                    <p className="font-medium text-zinc-200">Three ideas that clear up the buttons</p>
-                    <ul className="mt-2 list-inside list-disc space-y-1.5 marker:text-zinc-600">
-                      <li>
-                        <strong className="font-normal text-zinc-300">Rebuild</strong> = the server downloads your provider
-                        M3Us, merges them, applies filters, and overwrites the hosted file. Your IPTV app only ever sees that
-                        hosted file — not your raw provider links.
-                      </li>
-                      <li>
-                        <strong className="font-normal text-zinc-300">Options and rules</strong> save automatically when you
-                        change them here or in the visual editor. They take effect on the <em>next</em> rebuild.
-                      </li>
-                      <li>
-                        <strong className="font-normal text-zinc-300">“What changed”</strong> = a short count from the last
-                        rebuild vs the one before (new / removed-ish lines). It does not change anything by itself.
-                      </li>
-                    </ul>
-                  </div>
-
-                  <section className="rounded-lg border border-emerald-900/40 bg-emerald-950/15 p-4">
-                    <h3 className="text-xs font-semibold uppercase tracking-wide text-emerald-400/90">1 · Update the file your player uses</h3>
-                    <p className="mt-1 text-sm text-zinc-400">
-                      This is the important step. It can take a while on large playlists. Your TV app keeps polling the same
-                      player URL; it gets new content after a rebuild finishes.
-                    </p>
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => refreshPl(selected.id)}
-                      className="mt-3 min-h-11 w-full rounded-lg bg-emerald-500 px-4 py-3 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-40 sm:w-auto sm:py-2.5"
-                    >
-                      Rebuild M3U for player
-                    </button>
-                  </section>
-
                   <section className="rounded-lg border border-sky-900/35 bg-sky-950/10 p-4">
-                    <h3 className="text-xs font-semibold uppercase tracking-wide text-sky-400/90">2 · Browse channels &amp; build filters visually</h3>
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-sky-400/90">Visual playlist editor</h3>
                     <p className="mt-1 text-sm text-zinc-400">
-                      The editor shows channels from your <strong className="font-normal text-zinc-300">last successful rebuild</strong>.
-                      You can add “hide this group” style rules there — they save automatically; still run{" "}
-                      <strong className="font-normal text-zinc-300">Rebuild</strong> here (or inside the editor) so the player file updates.
+                      Browse channels from your <strong className="font-normal text-zinc-300">last successful server build</strong>,
+                      drag to reorder, and add hide/show rules. Rules save automatically; use{" "}
+                      <strong className="font-normal text-zinc-300">Refresh player file from sources</strong> below when you
+                      want the hosted M3U to match. After each refresh you can still open channels removed by rules in the
+                      editor under <strong className="font-normal text-zinc-300">Hidden by rules</strong>.
                     </p>
                     <Link
                       to={`organize/${selected.id}`}
@@ -772,43 +772,56 @@ export function App() {
                     </Link>
                   </section>
 
-                  <section className="rounded-lg border border-zinc-800 p-4">
-                    <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">3 · Options &amp; rules</h3>
-                    <p className="mt-1 text-sm text-zinc-400">
-                      TMDB / “Latest” checkboxes and the JSON below (if you use it) are stored in your playlist document as you
-                      change them — no separate save step.
+                  <div>
+                    <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">Player URL</p>
+                    <code className="mt-1 block max-h-40 overflow-auto break-all rounded-lg bg-zinc-900 p-3 text-xs text-emerald-200 sm:max-h-none">
+                      {publicPlaylistUrl(selected.publicToken)}
+                    </code>
+                    <p className="mt-2 text-xs text-zinc-500">
+                      Paste this URL into your IPTV app as the playlist address. It always points at the hosted file on this
+                      service — not your raw provider links.
                     </p>
-                    <p className="mt-2 text-xs text-zinc-500" aria-live="polite">
-                      {playlistAutosaveState === "saving" ? (
-                        <span className="text-sky-300/90">Saving…</span>
-                      ) : playlistAutosaveState === "saved" ? (
-                        <span className="text-emerald-300/90">Saved</span>
-                      ) : rulesJsonBlocked ? (
-                        <span className="text-amber-300/90">Auto-save paused — fix rules JSON so it parses.</span>
-                      ) : (
-                        <span>Changes save automatically.</span>
-                      )}
-                    </p>
-                  </section>
+                  </div>
 
-                  <section className="rounded-lg border border-zinc-800 p-4">
-                    <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">4 · What changed at the last rebuild?</h3>
+                  <section className="rounded-lg border border-emerald-900/40 bg-emerald-950/15 p-4">
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-emerald-400/90">Hosted file &amp; history</h3>
                     <p className="mt-1 text-sm text-zinc-400">
-                      After each rebuild we store a tiny summary (not the full channel list): how many channels, how many
-                      looked new vs the previous run, approximate removals.
+                      Your IPTV app only downloads the hosted M3U. These actions talk to the server; large playlists can take
+                      several minutes.
                     </p>
-                    <button
-                      type="button"
-                      disabled={busy || diffLoading}
-                      onClick={() => fetchDiff(selected.id)}
-                      className="mt-3 min-h-11 w-full rounded-lg border border-zinc-600 px-4 py-3 text-sm hover:bg-zinc-800 disabled:opacity-40 sm:w-auto sm:py-2"
-                    >
-                      {diffLoading ? "Loading…" : diffSummary !== undefined ? "Refresh comparison" : "Load comparison"}
-                    </button>
+                    <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
+                      <div className="flex min-h-11 flex-wrap items-center gap-1">
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => refreshPl(selected.id)}
+                          className="rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-40"
+                        >
+                          Refresh player file from sources
+                        </button>
+                        <InlineHelp text="Downloads fresh M3U from each saved source, merges them, applies your rules and order, then overwrites the hosted file behind your player URL. Your app keeps the same URL and sees new channels after this finishes." />
+                      </div>
+                      {busy && selected.refreshProgress ? (
+                        <p className="w-full text-sm text-amber-200/90" aria-live="polite">
+                          {formatRefreshProgressLine(selected.refreshProgress)}
+                        </p>
+                      ) : null}
+                      <div className="flex min-h-11 flex-wrap items-center gap-1">
+                        <button
+                          type="button"
+                          disabled={busy || diffLoading}
+                          onClick={() => fetchDiff(selected.id)}
+                          className="rounded-lg border border-zinc-600 px-4 py-2.5 text-sm hover:bg-zinc-800 disabled:opacity-40"
+                        >
+                          {diffLoading ? "Loading…" : diffSummary !== undefined ? "Refresh rebuild summary" : "Load rebuild summary"}
+                        </button>
+                        <InlineHelp text="Fetches a small JSON summary stored after each refresh: channel counts, approximate new lines vs the previous run, and approximate removals. Read-only — it does not change your playlist." />
+                      </div>
+                    </div>
                     {diffSummary === null && (
                       <p className="mt-3 text-sm text-zinc-500">
-                        No summary file yet — run <strong className="font-normal text-zinc-400">Rebuild M3U for player</strong>{" "}
-                        at least once. After the second rebuild you will see new vs previous counts.
+                        No summary yet — run <strong className="font-normal text-zinc-400">Refresh player file from sources</strong>{" "}
+                        at least once. After the second refresh you will see new vs previous counts.
                       </p>
                     )}
                     {diffSummary != null && diffSummary !== undefined && (
@@ -847,19 +860,19 @@ export function App() {
                     )}
                   </section>
 
-                  <div>
-                    <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">Player URL</p>
-                    <code className="mt-1 block max-h-40 overflow-auto break-all rounded-lg bg-zinc-900 p-3 text-xs text-emerald-200 sm:max-h-none">
-                      {publicPlaylistUrl(selected.publicToken)}
-                    </code>
-                    <p className="mt-2 text-xs text-zinc-500">
-                      Paste this single URL into your IPTV app as the M3U playlist address. Rebuild whenever you want the
-                      server to pull fresh data from your sources and regenerate that file.
-                    </p>
-                  </div>
-
                   <div className="space-y-2 rounded-lg border border-zinc-800 p-4">
                     <p className="text-xs font-semibold uppercase tracking-wide text-zinc-500">Playlist options</p>
+                    <p className="text-xs text-zinc-500" aria-live="polite">
+                      {playlistAutosaveState === "saving" ? (
+                        <span className="text-sky-300/90">Saving…</span>
+                      ) : playlistAutosaveState === "saved" ? (
+                        <span className="text-emerald-300/90">Saved</span>
+                      ) : rulesJsonBlocked ? (
+                        <span className="text-amber-300/90">Auto-save paused — fix rules JSON so it parses.</span>
+                      ) : (
+                        <span>Rules and options here save automatically; they apply on the next refresh from sources.</span>
+                      )}
+                    </p>
                     <label className="flex cursor-pointer items-start gap-2 text-sm text-zinc-300">
                       <input type="checkbox" className="mt-1" checked={enrich} onChange={(e) => setEnrich(e.target.checked)} />
                       <span>
@@ -935,7 +948,7 @@ export function App() {
 
             {!selectedPl && displayPlaylists.length > 0 && (
               <p className="rounded-xl border border-dashed border-zinc-700 bg-zinc-950/30 px-4 py-8 text-center text-sm text-zinc-500">
-                Choose a playlist above to rebuild, edit rules, and copy the player URL.
+                Choose a playlist above to open the editor, refresh the hosted file, and copy the player URL.
               </p>
             )}
           </div>

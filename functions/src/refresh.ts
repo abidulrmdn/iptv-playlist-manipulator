@@ -5,7 +5,7 @@ import type { Bucket } from "@google-cloud/storage";
 import { decryptUtf8, type EncPayload } from "./crypto.js";
 import { fetchXtreamM3uText } from "./xtream.js";
 import { LIMITS, type PlaylistRules } from "./constants.js";
-import { applyRules, mergePlaylistRules } from "./rules.js";
+import { mergePlaylistRules, partitionRulesKeptDropped } from "./rules.js";
 import { canonicalId, parseM3u, serializeM3u, type ChannelEntry } from "./m3u.js";
 import { enrichWithTmdb } from "./enrich.js";
 
@@ -31,6 +31,15 @@ export type PlaylistDoc = {
   enrichEnabled?: boolean;
   duplicateNewIntoLatest?: boolean;
   nextScheduledRefreshAt?: Timestamp;
+  /** Ephemeral UI progress during `runPlaylistRefresh`; deleted on success or failure. */
+  refreshProgress?: {
+    phase: "fetch" | "rules" | "tmdb" | "write";
+    detail?: string;
+    sourcesDone: number;
+    sourcesTotal: number;
+    channelsSoFar: number;
+    updatedAt?: Timestamp;
+  };
 };
 
 function assertLimits(sourcesCount: number, channels: number) {
@@ -463,12 +472,67 @@ export async function runPlaylistRefresh(params: {
 
   const rules = mergePlaylistRules(playlist.rules);
   const merged: ChannelEntry[] = [];
+  const sourcesTotal = Math.max(1, playlist.sourceIds.length);
 
-  for (const sid of playlist.sourceIds) {
+  let lastProgAt = 0;
+  const writeRefreshProgress = async (
+    payload: {
+      phase: "fetch" | "rules" | "tmdb" | "write";
+      detail?: string;
+      sourcesDone: number;
+      sourcesTotal: number;
+      channelsSoFar: number;
+    },
+    force: boolean,
+  ) => {
+    const t = Date.now();
+    if (!force && t - lastProgAt < LIMITS.REFRESH_PROGRESS_MIN_MS) return;
+    lastProgAt = t;
+    try {
+      await db
+        .collection("playlists")
+        .doc(playlistId)
+        .update({
+          refreshProgress: {
+            ...payload,
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+        });
+    } catch (e) {
+      console.error("[runPlaylistRefresh] refreshProgress write failed", e);
+    }
+  };
+
+  await writeRefreshProgress(
+    {
+      phase: "fetch",
+      detail: "Starting…",
+      sourcesDone: 0,
+      sourcesTotal: sourcesTotal,
+      channelsSoFar: 0,
+    },
+    true,
+  );
+
+  for (let si = 0; si < playlist.sourceIds.length; si++) {
+    const sid = playlist.sourceIds[si]!;
     const sSnap = await db.collection("sources").doc(sid).get();
     if (!sSnap.exists) continue;
     const s = sSnap.data() as SourceDoc;
     if (s.ownerUid !== ownerUid) continue;
+    if (s.kind !== "xtream" && !s.urlEnc) continue;
+
+    await writeRefreshProgress(
+      {
+        phase: "fetch",
+        detail: `Source ${si + 1} of ${playlist.sourceIds.length}`,
+        sourcesDone: si,
+        sourcesTotal: sourcesTotal,
+        channelsSoFar: merged.length,
+      },
+      true,
+    );
+
     let text: string;
     if (s.kind === "xtream") {
       if (!s.xtreamEnc) {
@@ -476,19 +540,64 @@ export async function runPlaylistRefresh(params: {
       }
       const plain = decryptUtf8(s.xtreamEnc);
       const cfg = JSON.parse(plain) as { baseUrl: string; username: string; password: string };
-      text = await fetchXtreamM3uText(cfg);
+      text = await fetchXtreamM3uText(cfg, {
+        onProgress: ({ built, detail }) => {
+          void writeRefreshProgress(
+            {
+              phase: "fetch",
+              detail: detail || `Xtream · source ${si + 1} of ${playlist.sourceIds.length}`,
+              sourcesDone: si,
+              sourcesTotal: sourcesTotal,
+              channelsSoFar: merged.length + built,
+            },
+            false,
+          );
+        },
+      });
     } else {
-      if (!s.urlEnc) continue;
-      const url = decryptUtf8(s.urlEnc);
+      const url = decryptUtf8(s.urlEnc!);
       text = await fetchM3u(url);
     }
     merged.push(...parseM3u(text));
+
+    await writeRefreshProgress(
+      {
+        phase: "fetch",
+        detail: `Finished source ${si + 1} of ${playlist.sourceIds.length}`,
+        sourcesDone: si + 1,
+        sourcesTotal: sourcesTotal,
+        channelsSoFar: merged.length,
+      },
+      true,
+    );
   }
 
   assertLimits(playlist.sourceIds.length, merged.length);
 
-  let stable = applyRules(merged, rules);
+  const { kept: stable, dropped: rulesDropped } = partitionRulesKeptDropped(merged, rules);
+
+  await writeRefreshProgress(
+    {
+      phase: "rules",
+      detail: "Applying filters & order",
+      sourcesDone: playlist.sourceIds.length,
+      sourcesTotal: sourcesTotal,
+      channelsSoFar: stable.length,
+    },
+    true,
+  );
+
   if (playlist.enrichEnabled && tmdbApiKey) {
+    await writeRefreshProgress(
+      {
+        phase: "tmdb",
+        detail: "TMDB enrichment",
+        sourcesDone: playlist.sourceIds.length,
+        sourcesTotal: sourcesTotal,
+        channelsSoFar: stable.length,
+      },
+      true,
+    );
     await enrichWithTmdb(stable, tmdbApiKey);
   }
 
@@ -515,6 +624,17 @@ export async function runPlaylistRefresh(params: {
     duplicateNewIntoLatest,
   });
 
+  await writeRefreshProgress(
+    {
+      phase: "write",
+      detail: "Uploading playlist files",
+      sourcesDone: playlist.sourceIds.length,
+      sourcesTotal: sourcesTotal,
+      channelsSoFar: finalChannels.length,
+    },
+    true,
+  );
+
   let body = serializeM3u(finalChannels);
   if (playlist.enrichEnabled && tmdbApiKey) {
     const attr =
@@ -534,6 +654,22 @@ export async function runPlaylistRefresh(params: {
     resumable: false,
     metadata: { cacheControl: "public, max-age=300" },
   });
+
+  const droppedPath = `${pref}/playlist.editor-rules-dropped.m3u`;
+  if (rulesDropped.length > 0) {
+    const droppedBody = serializeM3u(rulesDropped);
+    if (Buffer.byteLength(droppedBody, "utf8") <= LIMITS.MAX_M3U_BYTES) {
+      await bucket.file(droppedPath).save(droppedBody, {
+        contentType: "audio/x-mpegurl",
+        resumable: false,
+        metadata: { cacheControl: "private, max-age=0" },
+      });
+    } else {
+      await bucket.file(droppedPath).delete().catch(() => undefined);
+    }
+  } else {
+    await bucket.file(droppedPath).delete().catch(() => undefined);
+  }
 
   await bucket.file(`${pref}/canonical-ids.json`).save(JSON.stringify(stableIds), {
     contentType: "application/json",
@@ -566,6 +702,7 @@ export async function runPlaylistRefresh(params: {
       updatedAt: FieldValue.serverTimestamp(),
       lastSuccessAt: FieldValue.serverTimestamp(),
       lastError: FieldValue.delete(),
+      refreshProgress: FieldValue.delete(),
       channelCount: finalChannels.length,
       etag,
       storagePath: mainPath,

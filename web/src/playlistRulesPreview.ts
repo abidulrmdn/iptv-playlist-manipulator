@@ -2,7 +2,9 @@
  * Client-side preview of `functions/src/rules.ts` → `applyRules` (keep in sync when server rules change).
  * Used only to hide/show rows in the organizer; the rebuilt M3U still comes from the server.
  */
-import type { PlaylistRules } from "../../functions/src/constants";
+import type { PlaylistRules, RulePatternTabScope } from "../../functions/src/constants";
+import type { ChannelEntry } from "../../functions/src/m3u";
+import { classifyEditorTab } from "../../functions/src/editorTab";
 
 export type PreviewChannel = {
   duration: string;
@@ -14,6 +16,8 @@ export type PreviewChannel = {
   tvgName?: string;
   /** Server channel id (canonical); used with `rules.channelOrder` in the organizer preview. */
   editorId?: string;
+  /** When set, tab-scoped patterns use this tab (organizer row tab from the server). */
+  editorTab?: "tv" | "movie" | "series";
 };
 
 function compileSafe(pattern: string): RegExp | null {
@@ -27,6 +31,60 @@ function compileSafe(pattern: string): RegExp | null {
 function matchesAny(patterns: string[], value: string): boolean {
   for (const p of patterns) {
     const r = compileSafe(p);
+    if (r && r.test(value)) return true;
+  }
+  return false;
+}
+
+function previewTab<T extends PreviewChannel>(ch: T): ReturnType<typeof classifyEditorTab> {
+  if (ch.editorTab) return ch.editorTab;
+  return classifyEditorTab(ch as unknown as ChannelEntry);
+}
+
+function includePassScopedPreview<T extends PreviewChannel>(
+  ch: T,
+  patterns: string[],
+  scopes: RulePatternTabScope[],
+  value: string,
+): boolean {
+  const tab = previewTab(ch);
+  const applicable: string[] = [];
+  for (let i = 0; i < patterns.length; i++) {
+    const sc = scopes[i] ?? "all";
+    if (sc !== "all" && sc !== tab) continue;
+    applicable.push(patterns[i]!);
+  }
+  if (applicable.length === 0) return true;
+  return matchesAny(applicable, value);
+}
+
+function excludeHitScopedPreview<T extends PreviewChannel>(
+  ch: T,
+  patterns: string[],
+  scopes: RulePatternTabScope[],
+  value: string,
+): boolean {
+  const tab = previewTab(ch);
+  for (let i = 0; i < patterns.length; i++) {
+    const sc = scopes[i] ?? "all";
+    if (sc !== "all" && sc !== tab) continue;
+    const r = compileSafe(patterns[i]!);
+    if (r && r.test(value)) return true;
+  }
+  return false;
+}
+
+function allowMatchesScopedPreview<T extends PreviewChannel>(
+  ch: T,
+  patterns: string[],
+  scopes: RulePatternTabScope[],
+  value: string,
+): boolean {
+  const tab = previewTab(ch);
+  for (let i = 0; i < patterns.length; i++) {
+    const sc = scopes[i] ?? "all";
+    if (sc !== "all" && sc !== tab) continue;
+    const r = compileSafe(patterns[i]!);
     if (r && r.test(value)) return true;
   }
   return false;
@@ -73,19 +131,26 @@ export function applyRulesPreview<T extends PreviewChannel>(entries: T[], rules:
   const afterRename = out.map((e) => ({ ...e }));
 
   if (rules.includeGroupPatterns.length > 0) {
-    out = out.filter((ch) => matchesAny(rules.includeGroupPatterns, ch.groupTitle ?? ""));
+    const scopes = rules.includeGroupPatternScopes;
+    out = out.filter((ch) => includePassScopedPreview(ch, rules.includeGroupPatterns, scopes, ch.groupTitle ?? ""));
   }
-  out = out.filter((ch) => !matchesAny(rules.excludeGroupPatterns, ch.groupTitle ?? ""));
+  out = out.filter(
+    (ch) => !excludeHitScopedPreview(ch, rules.excludeGroupPatterns, rules.excludeGroupPatternScopes, ch.groupTitle ?? ""),
+  );
 
   if (rules.includeNamePatterns.length > 0) {
-    out = out.filter((ch) => matchesAny(rules.includeNamePatterns, ch.title));
+    const scopes = rules.includeNamePatternScopes;
+    out = out.filter((ch) => includePassScopedPreview(ch, rules.includeNamePatterns, scopes, ch.title));
   }
-  out = out.filter((ch) => !matchesAny(rules.excludeNamePatterns, ch.title));
+  out = out.filter(
+    (ch) => !excludeHitScopedPreview(ch, rules.excludeNamePatterns, rules.excludeNamePatternScopes, ch.title),
+  );
 
   if (rules.includeUrlPatterns.length > 0) {
-    out = out.filter((ch) => matchesAny(rules.includeUrlPatterns, ch.url));
+    const scopes = rules.includeUrlPatternScopes;
+    out = out.filter((ch) => includePassScopedPreview(ch, rules.includeUrlPatterns, scopes, ch.url));
   }
-  out = out.filter((ch) => !matchesAny(rules.excludeUrlPatterns, ch.url));
+  out = out.filter((ch) => !excludeHitScopedPreview(ch, rules.excludeUrlPatterns, rules.excludeUrlPatternScopes, ch.url));
 
   if (rules.dedupe) {
     const seen = new Set<string>();
@@ -102,15 +167,18 @@ export function applyRulesPreview<T extends PreviewChannel>(entries: T[], rules:
   const allowN = rules.allowNamePatterns;
   const allowU = rules.allowUrlPatterns;
   const allowG = rules.allowGroupPatterns;
+  const allowNS = rules.allowNamePatternScopes;
+  const allowUS = rules.allowUrlPatternScopes;
+  const allowGS = rules.allowGroupPatternScopes;
   if (allowN.length > 0 || allowU.length > 0 || allowG.length > 0) {
     const keyFn = (ch: T) =>
       rules.dedupeBy === "name" ? ch.title.trim().toLowerCase() : ch.url.trim();
     const inOut = new Set(out.map(keyFn));
     const rescued = afterRename.filter((ch) => {
       if (inOut.has(keyFn(ch))) return false;
-      if (allowN.length > 0 && matchesAny(allowN, ch.title)) return true;
-      if (allowU.length > 0 && matchesAny(allowU, ch.url)) return true;
-      if (allowG.length > 0 && matchesAny(allowG, ch.groupTitle ?? "")) return true;
+      if (allowN.length > 0 && allowMatchesScopedPreview(ch, allowN, allowNS, ch.title)) return true;
+      if (allowU.length > 0 && allowMatchesScopedPreview(ch, allowU, allowUS, ch.url)) return true;
+      if (allowG.length > 0 && allowMatchesScopedPreview(ch, allowG, allowGS, ch.groupTitle ?? "")) return true;
       return false;
     });
     if (rescued.length > 0) {

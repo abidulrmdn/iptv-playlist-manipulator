@@ -1,8 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import type { Dispatch, MutableRefObject, SetStateAction } from "react";
+import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { onAuthStateChanged, signOut, type User } from "firebase/auth";
-import { auth, callable, publicPlaylistUrl } from "./firebase";
-import { LIMITS } from "../../functions/src/constants";
+import { doc, onSnapshot } from "firebase/firestore";
+import { auth, callable, db, publicPlaylistUrl } from "./firebase";
+import { formatRefreshProgressLine, type PlaylistRefreshProgress } from "./refreshProgressFormat";
+import { LIMITS, type PlaylistRules, type RulePatternTabScope } from "../../functions/src/constants";
 import { escapeRegExp } from "../../functions/src/excludeNamePatternChunks";
 import { applyRulesPreview, type PreviewChannel } from "./playlistRulesPreview";
 
@@ -18,24 +22,7 @@ type EditorRow = {
   tab: EditorTab;
 };
 
-type PlaylistRules = {
-  dedupe: boolean;
-  dedupeBy: "url" | "name";
-  includeGroupPatterns: string[];
-  excludeGroupPatterns: string[];
-  includeNamePatterns: string[];
-  excludeNamePatterns: string[];
-  includeUrlPatterns: string[];
-  excludeUrlPatterns: string[];
-  allowNamePatterns: string[];
-  allowUrlPatterns: string[];
-  allowGroupPatterns: string[];
-  groupRenames: { pattern: string; replacement: string }[];
-  groupOrder: string[];
-  channelOrder: string[];
-  latestGroupName: string;
-  newMarkerPrefix: string;
-};
+type ContextMenuState = { x: number; y: number; row: EditorRow; scope: "group" | "channel"; groupKey: string };
 
 function errMsg(e: unknown): string {
   if (e instanceof Error) {
@@ -64,6 +51,7 @@ function rowToPreviewEntry(r: EditorRow): RowEntry {
     tvgLogo: r.tvgLogo,
     tvgName: r.tvgName,
     editorId: r.id,
+    editorTab: r.tab,
     __rowId: r.id,
   };
 }
@@ -126,6 +114,7 @@ function ChannelThumb({ row }: { row: EditorRow }) {
         src={row.tvgLogo}
         alt=""
         loading="lazy"
+        decoding="async"
         referrerPolicy="no-referrer"
         className="h-11 w-11 shrink-0 rounded-lg border border-zinc-700/80 bg-zinc-950 object-cover"
       />
@@ -137,6 +126,114 @@ function ChannelThumb({ row }: { row: EditorRow }) {
       aria-hidden
     >
       {row.tab === "tv" ? "TV" : row.tab === "movie" ? "M" : "S"}
+    </div>
+  );
+}
+
+/** Virtual row height hint; `measureElement` corrects per row after paint. */
+const CHANNEL_ROW_ESTIMATE_PX = 96;
+
+type VirtualGroupChannelListProps = {
+  group: string;
+  gRows: EditorRow[];
+  selected: Set<string>;
+  toggleSel: (id: string) => void;
+  setMenu: Dispatch<SetStateAction<ContextMenuState | null>>;
+  reorderChannelInGroup: (groupKey: string, fromId: string, toId: string) => void;
+  dragChannelRef: MutableRefObject<{ groupKey: string; id: string } | null>;
+  dragGroupRef: MutableRefObject<string | null>;
+};
+
+function VirtualGroupChannelList({
+  group,
+  gRows,
+  selected,
+  toggleSel,
+  setMenu,
+  reorderChannelInGroup,
+  dragChannelRef,
+  dragGroupRef,
+}: VirtualGroupChannelListProps) {
+  const parentRef = useRef<HTMLDivElement>(null);
+  const virtualizer = useVirtualizer({
+    count: gRows.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => CHANNEL_ROW_ESTIMATE_PX,
+    overscan: 10,
+  });
+
+  return (
+    <div ref={parentRef} className="max-h-[min(60vh,520px)] overflow-y-auto overflow-x-hidden">
+      <ul className="relative w-full" role="list" style={{ height: gRows.length ? virtualizer.getTotalSize() : undefined }}>
+        {virtualizer.getVirtualItems().map((vi) => {
+          const r = gRows[vi.index]!;
+          return (
+            <li
+              key={r.id}
+              role="listitem"
+              data-index={vi.index}
+              ref={virtualizer.measureElement}
+              className={`absolute left-0 top-0 box-border flex w-full max-w-full gap-3 border-b border-zinc-800/90 px-4 py-3 transition-colors hover:bg-zinc-800/25 ${
+                selected.has(r.id) ? "bg-emerald-500/5 ring-1 ring-inset ring-emerald-500/25" : ""
+              }`}
+              style={{ transform: `translateY(${vi.start}px)` }}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setMenu({ x: e.clientX, y: e.clientY, row: r, scope: "channel", groupKey: group });
+              }}
+              onDragOver={(e) => {
+                if (dragChannelRef.current?.groupKey === group) e.preventDefault();
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                const payload = dragChannelRef.current;
+                dragChannelRef.current = null;
+                if (!payload || payload.groupKey !== group || payload.id === r.id) return;
+                reorderChannelInGroup(group, payload.id, r.id);
+              }}
+              onDragEnd={() => {
+                dragChannelRef.current = null;
+              }}
+            >
+              <div className="flex shrink-0 items-start gap-1 pt-0.5">
+                <span
+                  draggable
+                  title="Drag to reorder within this group"
+                  onDragStart={(ev) => {
+                    ev.stopPropagation();
+                    dragChannelRef.current = { groupKey: group, id: r.id };
+                    dragGroupRef.current = null;
+                    ev.dataTransfer.effectAllowed = "move";
+                    ev.dataTransfer.setData("text/plain", `ch:${r.id}`);
+                  }}
+                  onDragEnd={() => {
+                    dragChannelRef.current = null;
+                  }}
+                  className="mt-0.5 inline-flex cursor-grab select-none rounded-md border border-transparent p-1 text-zinc-500 hover:border-zinc-600 hover:bg-zinc-800/50 hover:text-zinc-300 active:cursor-grabbing"
+                >
+                  <DragGripIcon />
+                </span>
+                <input
+                  type="checkbox"
+                  checked={selected.has(r.id)}
+                  onChange={() => toggleSel(r.id)}
+                  className="mt-1"
+                  aria-label={`Select ${r.title}`}
+                />
+              </div>
+              <ChannelThumb row={r} />
+              <div className="min-w-0 flex-1">
+                <div className="line-clamp-2 text-sm font-medium leading-snug text-zinc-100">{r.title}</div>
+                {r.tvgName ? <div className="mt-0.5 line-clamp-1 text-xs text-zinc-500">{r.tvgName}</div> : null}
+                <div className="mt-1.5 break-all font-mono text-[11px] leading-relaxed text-zinc-500 lg:text-xs">{r.url}</div>
+              </div>
+              <div className="flex shrink-0 flex-col items-end gap-1 pt-0.5">
+                <TabPill tab={r.tab} />
+              </div>
+            </li>
+          );
+        })}
+      </ul>
     </div>
   );
 }
@@ -219,6 +316,21 @@ const orgBtnSkySolid =
 
 const PLAYLIST_ORG_SIDEBAR_KEY = "playlistOrganizer.playlistSidebarOpen";
 
+function InlineHelp({ text }: { text: string }) {
+  return (
+    <span
+      className="ml-1 inline-flex h-5 w-5 shrink-0 cursor-help select-none items-center justify-center rounded-full border border-zinc-600 text-[10px] font-bold text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
+      title={text}
+      role="img"
+      aria-label={text}
+    >
+      ?
+    </span>
+  );
+}
+
+type EditorDataSet = "player" | "rulesDropped";
+
 const SIMPLE_MATCH_OPTIONS: { id: SimpleMatchKind; title: string; hint: string }[] = [
   {
     id: "exact",
@@ -257,20 +369,21 @@ export function PlaylistOrganizer() {
   const [enrichEnabled, setEnrichEnabled] = useState(false);
   const [dupLatest, setDupLatest] = useState(true);
   const [rules, setRules] = useState<PlaylistRules | null>(null);
+  /** `player` = hosted M3U; `rulesDropped` = channels removed by rules on the last refresh (separate server file). */
+  const [editorDataSet, setEditorDataSet] = useState<EditorDataSet>("player");
 
   const [tab, setTab] = useState<EditorTab | "all">("all");
   const [q, setQ] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
-  type ContextMenuState = { x: number; y: number; row: EditorRow; scope: "group" | "channel"; groupKey: string };
   const [menu, setMenu] = useState<ContextMenuState | null>(null);
   const dragGroupRef = useRef<string | null>(null);
   const dragChannelRef = useRef<{ groupKey: string; id: string } | null>(null);
   /** When rules hide rows, toggles between “included only” and “excluded only” among loaded rows. */
   const [showExcluded, setShowExcluded] = useState(false);
   const [filterModal, setFilterModal] = useState<FilterModalState | null>(null);
-  /** Group names whose channel rows are hidden (header row stays visible). */
-  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
+  /** Group names whose channel list is expanded; omitted groups stay collapsed (default). */
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set());
   const skipNextRulesAutosave = useRef(false);
   const rulesAutosaveToken = useRef(0);
   /** Bumped before server-authoritative rule writes / reloads so debounced `updatePlaylist` cannot overwrite with stale rules. */
@@ -311,6 +424,32 @@ export function PlaylistOrganizer() {
     setTimeout(() => setToast(null), 4800);
   }, []);
 
+  const [refreshProgress, setRefreshProgress] = useState<PlaylistRefreshProgress | null>(null);
+
+  useEffect(() => {
+    if (!playlistId || !user) {
+      setRefreshProgress(null);
+      return;
+    }
+    const unsub = onSnapshot(
+      doc(db, "playlists", playlistId),
+      (snap) => {
+        if (!snap.exists()) {
+          setRefreshProgress(null);
+          return;
+        }
+        const rp = snap.data()?.refreshProgress as unknown;
+        if (rp && typeof rp === "object" && rp !== null && "channelsSoFar" in rp) {
+          setRefreshProgress(rp as PlaylistRefreshProgress);
+        } else {
+          setRefreshProgress(null);
+        }
+      },
+      () => setRefreshProgress(null),
+    );
+    return () => unsub();
+  }, [playlistId, user]);
+
   const load = useCallback(
     async (reset: boolean) => {
       if (!playlistId || !user) return;
@@ -320,7 +459,7 @@ export function PlaylistOrganizer() {
         rulesSaveGeneration.current += 1;
         const off = reset ? 0 : loadedThroughRef.current;
         const fn = callable<
-          { playlistId: string; offset?: number; limit?: number },
+          { playlistId: string; offset?: number; limit?: number; dataSet?: string },
           {
             name: string;
             publicToken: string;
@@ -332,9 +471,16 @@ export function PlaylistOrganizer() {
             hasMore: boolean;
             enrichEnabled: boolean;
             duplicateNewIntoLatest: boolean;
+            dataSet?: string;
+            rulesDroppedAvailable?: boolean;
           }
         >("getPlaylistEditorData", { timeout: 120_000 });
-        const r = await fn({ playlistId, offset: off, limit: 1500 });
+        const r = await fn({
+          playlistId,
+          offset: off,
+          limit: LIMITS.MAX_EDITOR_PAGE_SIZE,
+          dataSet: editorDataSet === "rulesDropped" ? "rulesDropped" : "player",
+        });
         const d = r.data;
         skipNextRulesAutosave.current = true;
         setName(d.name);
@@ -345,11 +491,13 @@ export function PlaylistOrganizer() {
         setTotal(d.total);
         setHasMore(d.hasMore);
         loadedThroughRef.current = d.offset + d.channels.length;
-        setRows((prev) => {
-          if (reset) return d.channels;
-          const seen = new Set(prev.map((x) => x.id));
-          const add = d.channels.filter((c) => !seen.has(c.id));
-          return [...prev, ...add];
+        startTransition(() => {
+          setRows((prev) => {
+            if (reset) return d.channels;
+            const seen = new Set(prev.map((x) => x.id));
+            const add = d.channels.filter((c) => !seen.has(c.id));
+            return [...prev, ...add];
+          });
         });
       } catch (e) {
         notify(errMsg(e));
@@ -357,14 +505,94 @@ export function PlaylistOrganizer() {
         setBusy(false);
       }
     },
-    [playlistId, user, notify],
+    [playlistId, user, notify, editorDataSet],
   );
+
+  /** Fetches every remaining page from the current offset until the server reports no more rows. */
+  const loadAllRemaining = useCallback(async () => {
+    if (!playlistId || !user) return;
+    setBusy(true);
+    const maxPages = Math.ceil(LIMITS.MAX_CHANNELS_PER_PLAYLIST / LIMITS.MAX_EDITOR_PAGE_SIZE) + 2;
+    try {
+      rulesSaveGeneration.current += 1;
+      const ds = editorDataSet === "rulesDropped" ? "rulesDropped" : "player";
+      const fn = callable<
+        { playlistId: string; offset?: number; limit?: number; dataSet?: string },
+        {
+          name: string;
+          publicToken: string;
+          rules: PlaylistRules;
+          channels: EditorRow[];
+          total: number;
+          offset: number;
+          limit: number;
+          hasMore: boolean;
+          enrichEnabled: boolean;
+          duplicateNewIntoLatest: boolean;
+          dataSet?: string;
+          rulesDroppedAvailable?: boolean;
+        }
+      >("getPlaylistEditorData", { timeout: 120_000 });
+
+      let off = loadedThroughRef.current;
+      let pages = 0;
+      let lastTotal = 0;
+
+      while (pages < maxPages) {
+        const r = await fn({
+          playlistId,
+          offset: off,
+          limit: LIMITS.MAX_EDITOR_PAGE_SIZE,
+          dataSet: ds,
+        });
+        const d = r.data;
+        pages += 1;
+        lastTotal = d.total;
+        skipNextRulesAutosave.current = true;
+        setName(d.name);
+        setPublicToken(d.publicToken ?? "");
+        setRules(d.rules);
+        setEnrichEnabled(Boolean(d.enrichEnabled));
+        setDupLatest(d.duplicateNewIntoLatest !== false);
+        setTotal(d.total);
+        setHasMore(d.hasMore);
+        const nextOff = d.offset + d.channels.length;
+        loadedThroughRef.current = nextOff;
+        startTransition(() => {
+          setRows((prev) => {
+            const seen = new Set(prev.map((x) => x.id));
+            const add = d.channels.filter((c) => !seen.has(c.id));
+            return [...prev, ...add];
+          });
+        });
+        off = nextOff;
+        await new Promise<void>((resolve) => {
+          requestAnimationFrame(() => resolve());
+        });
+        if (!d.hasMore) break;
+        if (d.channels.length === 0) break;
+      }
+
+      if (pages >= maxPages) {
+        notify("Stopped after safety cap — try reloading or contact support if the playlist is huge.");
+      } else {
+        notify(`Finished loading the table (${lastTotal.toLocaleString()} channels).`);
+      }
+    } catch (e) {
+      notify(errMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [playlistId, user, notify, editorDataSet]);
 
   useEffect(() => {
     if (user && playlistId) void load(true);
   }, [user, playlistId, load]);
 
   const { tableSourceRows, excludedCount } = useMemo(() => {
+    if (editorDataSet === "rulesDropped") {
+      return { tableSourceRows: rows, excludedCount: 0 };
+    }
     if (!rules || rows.length === 0) {
       return { tableSourceRows: rows, excludedCount: 0 };
     }
@@ -374,7 +602,12 @@ export function PlaylistOrganizer() {
     const excludedCount = excluded.length;
     const tableSourceRows = showExcluded ? excluded : rows.filter((r) => keptIds.has(r.id));
     return { tableSourceRows, excludedCount };
-  }, [rows, rules, showExcluded]);
+  }, [rows, rules, showExcluded, editorDataSet]);
+
+  useEffect(() => {
+    setSelected(new Set());
+    setShowExcluded(false);
+  }, [editorDataSet]);
 
   useEffect(() => {
     if (excludedCount === 0) setShowExcluded(false);
@@ -386,18 +619,18 @@ export function PlaylistOrganizer() {
     return c;
   }, [tableSourceRows]);
 
+  const deferredQ = useDeferredValue(q.trim().toLowerCase());
   const visible = useMemo(() => {
-    const qq = q.trim().toLowerCase();
     return tableSourceRows.filter((r) => {
       if (tab !== "all" && r.tab !== tab) return false;
-      if (!qq) return true;
+      if (!deferredQ) return true;
       return (
-        r.title.toLowerCase().includes(qq) ||
-        r.groupTitle.toLowerCase().includes(qq) ||
-        r.url.toLowerCase().includes(qq)
+        r.title.toLowerCase().includes(deferredQ) ||
+        r.groupTitle.toLowerCase().includes(deferredQ) ||
+        r.url.toLowerCase().includes(deferredQ)
       );
     });
-  }, [tableSourceRows, tab, q]);
+  }, [tableSourceRows, tab, deferredQ]);
 
   /** “Exclude selected” always runs on the server over the full generated M3U (not only loaded table rows). */
   const excludeSelectedStats = useMemo(
@@ -445,7 +678,7 @@ export function PlaylistOrganizer() {
   const visibleGroupNames = useMemo(() => new Set(groupedVisible.map((g) => g.group)), [groupedVisible]);
 
   useEffect(() => {
-    setCollapsedGroups((prev) => {
+    setExpandedGroups((prev) => {
       let pruned = false;
       const next = new Set<string>();
       for (const k of prev) {
@@ -457,7 +690,7 @@ export function PlaylistOrganizer() {
   }, [visibleGroupNames]);
 
   const toggleGroupCollapsed = (group: string) => {
-    setCollapsedGroups((prev) => {
+    setExpandedGroups((prev) => {
       const n = new Set(prev);
       if (n.has(group)) n.delete(group);
       else n.add(group);
@@ -466,10 +699,10 @@ export function PlaylistOrganizer() {
   };
 
   const collapseAllGroups = () => {
-    setCollapsedGroups(new Set(groupedVisible.map((g) => g.group)));
+    setExpandedGroups(new Set());
   };
 
-  const expandAllGroups = () => setCollapsedGroups(new Set());
+  const expandAllGroups = () => setExpandedGroups(new Set(groupedVisible.map((g) => g.group)));
 
   const reorderChannelInGroup = useCallback(
     (groupKey: string, fromId: string, toId: string) => {
@@ -487,7 +720,7 @@ export function PlaylistOrganizer() {
       const rest = (rules.channelOrder ?? []).filter((id) => !set.has(id));
       const merged = capChannelOrderList([...next, ...rest]);
       setRules({ ...rules, channelOrder: merged });
-      notify("Channel order updated — rebuild M3U when you want the player file to match.");
+      notify("Channel order updated — refresh the player file when you want the hosted M3U to match.");
     },
     [rules, groupedVisible, notify],
   );
@@ -505,7 +738,7 @@ export function PlaylistOrganizer() {
       const vis = new Set(next);
       const tail = rules.groupOrder.filter((name) => !vis.has(name));
       setRules({ ...rules, groupOrder: [...next, ...tail] });
-      notify("Group order updated — rebuild M3U when you want the player file to match.");
+      notify("Group order updated — refresh the player file when you want the hosted M3U to match.");
     },
     [rules, groupedVisible, notify],
   );
@@ -515,7 +748,7 @@ export function PlaylistOrganizer() {
     const g = menu.groupKey;
     setRules({ ...rules, groupOrder: [g, ...rules.groupOrder.filter((x) => x !== g)] });
     setMenu(null);
-    notify("Group moved to top — rebuild M3U when you want the player file to match.");
+    notify("Group moved to top — refresh the player file when you want the hosted M3U to match.");
   }, [menu, rules, notify]);
 
   const moveChannelToTopFromMenu = useCallback(() => {
@@ -524,7 +757,7 @@ export function PlaylistOrganizer() {
     const merged = capChannelOrderList([id, ...(rules.channelOrder ?? []).filter((x) => x !== id)]);
     setRules({ ...rules, channelOrder: merged });
     setMenu(null);
-    notify("Channel moved to top of its group — rebuild M3U when you want the player file to match.");
+    notify("Channel moved to top of its group — refresh the player file when you want the hosted M3U to match.");
   }, [menu, rules, notify]);
 
   const toggleGroupRows = (gRows: EditorRow[]) => {
@@ -579,7 +812,7 @@ export function PlaylistOrganizer() {
         timeout: 600_000,
       });
       await fn({ playlistId });
-      notify("Rebuild finished — player URL now serves the new M3U. Reloading channel list…");
+      notify("Player file updated — reloading this table from the server…");
       await load(true);
     } catch (e) {
       notify(errMsg(e));
@@ -685,11 +918,40 @@ export function PlaylistOrganizer() {
           : mode === "exclude"
             ? "excludeUrlPatterns"
             : "includeUrlPatterns";
-    const arr = [...rules[key]];
-    if (!arr.includes(pattern)) arr.push(pattern);
-    setRules({ ...rules, [key]: arr });
+    const SCOPE_FIELD = {
+      includeGroupPatterns: "includeGroupPatternScopes",
+      excludeGroupPatterns: "excludeGroupPatternScopes",
+      includeNamePatterns: "includeNamePatternScopes",
+      excludeNamePatterns: "excludeNamePatternScopes",
+      includeUrlPatterns: "includeUrlPatternScopes",
+      excludeUrlPatterns: "excludeUrlPatternScopes",
+    } as const satisfies Record<
+      | "includeGroupPatterns"
+      | "excludeGroupPatterns"
+      | "includeNamePatterns"
+      | "excludeNamePatterns"
+      | "includeUrlPatterns"
+      | "excludeUrlPatterns",
+      keyof PlaylistRules
+    >;
+    const patternsKey = key as keyof typeof SCOPE_FIELD;
+    const scopesKey = SCOPE_FIELD[patternsKey];
+    const arr = [...rules[patternsKey]];
+    const scopeArr: RulePatternTabScope[] = [...rules[scopesKey]];
+    while (scopeArr.length < arr.length) scopeArr.push("all");
+    scopeArr.length = arr.length;
+    const scope: RulePatternTabScope = tab === "all" ? "all" : tab;
+    if (!arr.includes(pattern)) {
+      arr.push(pattern);
+      scopeArr.push(scope);
+    }
+    setRules({ ...rules, [patternsKey]: arr, [scopesKey]: scopeArr });
     setFilterModal(null);
-    notify(`Added ${mode} pattern on ${field}.`);
+    notify(
+      tab === "all"
+        ? `Added ${mode} pattern on ${field}.`
+        : `Added ${mode} pattern on ${field} (applies only to ${tab === "tv" ? "TV" : tab === "movie" ? "Movies" : "Series"}).`,
+    );
   };
 
   const excludeSelectedByName = async () => {
@@ -752,20 +1014,33 @@ export function PlaylistOrganizer() {
 
   /** Add allow-* regex chunks so selected rows pass the rules again after save + rebuild. */
   const includeSelectedAgain = () => {
-    if (!rules || !showExcluded) return;
+    if (!rules) return;
+    const inRulesDroppedView = editorDataSet === "rulesDropped";
+    if (!inRulesDroppedView && !showExcluded) return;
     const keptRows = applyRulesPreview(rows.map(rowToPreviewEntry), rules);
     const keptIds = new Set(keptRows.map((e) => (e as RowEntry).__rowId));
     const pick = rows.filter((r) => selected.has(r.id) && !keptIds.has(r.id));
     if (pick.length === 0) {
       notify(
         selected.size > 0
-          ? "No selected rows are currently excluded — pick hidden channels or load more."
-          : "Select excluded channels to include again.",
+          ? inRulesDroppedView
+            ? "Nothing to add for the current selection — those rows already pass your saved rules in preview (try editing rules or pick other rows)."
+            : "No selected rows are currently excluded — pick hidden channels or load more."
+          : inRulesDroppedView
+            ? "Select one or more hidden channels, then Include again to add allow rules for them."
+            : "Select excluded channels to include again.",
       );
       return;
     }
     const chunkSize = 80;
-    const addChunked = (rawValues: string[], into: string[], field: "name" | "url" | "group"): boolean => {
+    const addChunked = (
+      rawValues: string[],
+      into: string[],
+      intoScopes: RulePatternTabScope[],
+      field: "name" | "url" | "group",
+    ): boolean => {
+      while (intoScopes.length < into.length) intoScopes.push("all");
+      intoScopes.length = into.length;
       const unique = [...new Set(rawValues.map((s) => s.trim()).filter(Boolean))];
       for (let i = 0; i < unique.length; i += chunkSize) {
         const chunk = unique.slice(i, i + chunkSize);
@@ -777,28 +1052,35 @@ export function PlaylistOrganizer() {
           notify(`Could not build allow-by-${field} pattern(s) — try a smaller selection or shorter values.`);
           return false;
         }
-        if (!into.includes(pattern)) into.push(pattern);
+        if (!into.includes(pattern)) {
+          into.push(pattern);
+          intoScopes.push("all");
+        }
       }
       return true;
     };
     const allowNamePatterns = [...rules.allowNamePatterns];
+    const allowNamePatternScopes = [...rules.allowNamePatternScopes];
     const allowUrlPatterns = [...rules.allowUrlPatterns];
+    const allowUrlPatternScopes = [...rules.allowUrlPatternScopes];
     if (!addChunked(
       pick.map((r) => r.title),
       allowNamePatterns,
+      allowNamePatternScopes,
       "name",
     ))
       return;
     if (!addChunked(
       pick.map((r) => r.url),
       allowUrlPatterns,
+      allowUrlPatternScopes,
       "url",
     ))
       return;
-    setRules({ ...rules, allowNamePatterns, allowUrlPatterns });
+    setRules({ ...rules, allowNamePatterns, allowNamePatternScopes, allowUrlPatterns, allowUrlPatternScopes });
     clearSel();
     notify(
-      `Added allow patterns for ${pick.length.toLocaleString()} excluded channel(s). Rebuild M3U when you want the player file to match.`,
+      `Added allow patterns for ${pick.length.toLocaleString()} excluded channel(s). Refresh the player file when you want the hosted M3U to match.`,
     );
   };
 
@@ -901,10 +1183,9 @@ export function PlaylistOrganizer() {
             <div>
               <p className="text-xs uppercase tracking-wide text-zinc-500">Visual playlist editor</p>
               <p className="mt-2 text-xs leading-relaxed text-zinc-500">
-                This list reflects your <strong className="font-normal text-zinc-400">last successful rebuild</strong> (merged M3U on
-                the server). Filters, order, and checkboxes <strong className="font-normal text-zinc-400">save automatically</strong>.{" "}
-                <strong className="font-normal text-zinc-400">Rebuild M3U for player</strong> pulls fresh provider data so your IPTV app
-                sees updates.
+                Use <strong className="font-normal text-zinc-400">In player file</strong> to match what your IPTV app loads today, or{" "}
+                <strong className="font-normal text-zinc-400">Hidden by rules</strong> to see channels the server stripped on the last
+                refresh. Filters, order, and checkboxes <strong className="font-normal text-zinc-400">save automatically</strong>.
               </p>
             </div>
             <div className="flex flex-wrap gap-2">
@@ -916,14 +1197,22 @@ export function PlaylistOrganizer() {
               </button>
             </div>
             <div className="flex flex-col gap-2">
-              <button
-                type="button"
-                disabled={busy}
-                onClick={() => void rebuildM3u()}
-                className="w-full rounded-lg bg-emerald-500 px-3 py-2.5 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-40"
-              >
-                Rebuild M3U for player
-              </button>
+              <div className="flex w-full items-center gap-0.5">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void rebuildM3u()}
+                  className="min-w-0 flex-1 rounded-lg bg-emerald-500 px-2 py-2.5 text-sm font-semibold leading-snug text-emerald-950 hover:bg-emerald-400 disabled:opacity-40"
+                >
+                  Refresh player file from sources
+                </button>
+                <InlineHelp text="Downloads fresh M3U from each saved source, merges them, applies your rules and order, then overwrites the hosted file behind your player URL. Your app keeps the same URL; large lists can take several minutes." />
+              </div>
+              {busy && refreshProgress ? (
+                <p className="text-center text-xs leading-snug text-amber-200/90" aria-live="polite">
+                  {formatRefreshProgressLine(refreshProgress)}
+                </p>
+              ) : null}
               <p className="text-center text-[11px] text-zinc-500" aria-live="polite">
                 {rulesAutosaveState === "saving" ? (
                   <span className="text-sky-300/90">Saving…</span>
@@ -933,14 +1222,18 @@ export function PlaylistOrganizer() {
                   <span>Rules save automatically</span>
                 )}
               </p>
-              <button
-                type="button"
-                disabled={busy}
-                onClick={() => void load(true)}
-                className="w-full rounded-lg border border-zinc-600 px-3 py-2.5 text-sm hover:bg-zinc-800 disabled:opacity-40"
-              >
-                Reload table from server
-              </button>
+              <div className="flex w-full items-center gap-0.5">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void load(true)}
+                  title="Discards unsaved-in-memory table state: re-downloads the current list from Firebase for this data source (player file or hidden-by-rules), reapplies your saved rules metadata, and resets pagination to the first page."
+                  className="min-w-0 flex-1 rounded-lg border border-zinc-600 px-2 py-2.5 text-sm leading-snug hover:bg-zinc-800 disabled:opacity-40"
+                >
+                  Reload table from server
+                </button>
+                <InlineHelp text="Fetches the latest channel list from the server for whichever data source is selected next to the category tabs (player file vs hidden by rules). Use this if the table looks stale after a refresh elsewhere, without running a full source pull again." />
+              </div>
             </div>
             {publicToken ? (
               <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-3">
@@ -974,11 +1267,44 @@ export function PlaylistOrganizer() {
             </button>
           ))}
           <span className="ml-auto text-xs text-zinc-500">
-            Loaded {rows.length} / {total} rows
-            {excludedCount > 0 && !showExcluded ? ` · ${excludedCount} hidden by rules` : ""}
-            {showExcluded ? " · showing excluded only" : ""}
+            Loaded {rows.length.toLocaleString()} / {total.toLocaleString()}{" "}
+            {editorDataSet === "rulesDropped" ? "hidden rows" : "rows"}
+            {editorDataSet === "player" && excludedCount > 0 && !showExcluded ? ` · ${excludedCount} hidden by rules (preview)` : ""}
+            {editorDataSet === "player" && showExcluded ? " · showing rules preview (excluded only)" : ""}
+            {editorDataSet === "rulesDropped" ? " · last refresh snapshot" : ""}
             {enrichEnabled ? " · enrichment on" : ""}
           </span>
+        </div>
+
+        <div className="flex flex-col gap-2 rounded-xl border border-zinc-800 bg-zinc-950/40 p-3 sm:flex-row sm:flex-wrap sm:items-center">
+          <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Data source</span>
+          <div className="flex flex-wrap gap-1 rounded-lg bg-zinc-900/90 p-0.5">
+            <button
+              type="button"
+              onClick={() => setEditorDataSet("player")}
+              className={`rounded-md px-3 py-1.5 text-sm font-medium ${
+                editorDataSet === "player" ? "bg-emerald-500 text-emerald-950" : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+              }`}
+            >
+              In player file
+            </button>
+            <button
+              type="button"
+              onClick={() => setEditorDataSet("rulesDropped")}
+              className={`rounded-md px-3 py-1.5 text-sm font-medium ${
+                editorDataSet === "rulesDropped"
+                  ? "bg-violet-500 text-violet-950"
+                  : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+              }`}
+            >
+              Hidden by rules (last rebuild)
+            </button>
+          </div>
+          <p className="text-xs leading-snug text-zinc-500 sm:ml-auto sm:max-w-xl">
+            {editorDataSet === "player"
+              ? "Table rows match the hosted M3U your IPTV app uses. The “hidden by rules” count is a live preview: rows still in the file that your saved rules would remove before the next refresh."
+              : "Rows the server removed when it last built the player file. Select any you want back and tap Include again to add allow patterns, then refresh the player file."}
+          </p>
         </div>
 
         <div className="flex flex-wrap gap-6 rounded-xl border border-zinc-800 bg-zinc-900/40 px-4 py-3 text-sm text-zinc-300">
@@ -1023,9 +1349,13 @@ export function PlaylistOrganizer() {
                   </button>
                   <button
                     type="button"
-                    disabled={busy || total === 0}
+                    disabled={busy || total === 0 || editorDataSet === "rulesDropped"}
                     onClick={() => void selectEntirePlaylist()}
-                    title="Select every channel id on the server (may be more than loaded in the table)"
+                    title={
+                      editorDataSet === "rulesDropped"
+                        ? "Switch to “In player file” to select every id in the hosted M3U (this list is only channels removed by rules)."
+                        : "Select every channel id on the server (may be more than loaded in the table)"
+                    }
                     className={orgBtnEmerald}
                   >
                     Entire playlist
@@ -1053,7 +1383,7 @@ export function PlaylistOrganizer() {
                   </>
                 ) : null}
 
-                {rules && excludedCount > 0 ? (
+                {editorDataSet === "player" && rules && excludedCount > 0 ? (
                   <>
                     <span className="hidden w-14 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-zinc-500 sm:block">
                       View
@@ -1082,9 +1412,13 @@ export function PlaylistOrganizer() {
                 <div className={`${orgCluster} flex-1 sm:flex-initial`}>
                   <button
                     type="button"
-                    disabled={busy || !rules || selected.size === 0}
+                    disabled={busy || !rules || selected.size === 0 || editorDataSet === "rulesDropped"}
                     onClick={() => void excludeSelectedByName()}
-                    title={excludeSelectedButtonTitle}
+                    title={
+                      editorDataSet === "rulesDropped"
+                        ? "Switch to “In player file” to run bulk exclude against the hosted M3U on the server."
+                        : excludeSelectedButtonTitle
+                    }
                     className={orgBtnAmber}
                   >
                     {excludeSelectedStats.selectedTotal === 0 ? (
@@ -1098,11 +1432,17 @@ export function PlaylistOrganizer() {
                       </>
                     )}
                   </button>
-                  {showExcluded && rules ? (
+                  {rules &&
+                  ((editorDataSet === "player" && showExcluded) || editorDataSet === "rulesDropped") ? (
                     <button
                       type="button"
                       disabled={busy || selected.size === 0}
                       onClick={includeSelectedAgain}
+                      title={
+                        editorDataSet === "rulesDropped"
+                          ? "Adds name + URL allow patterns for the selection so these streams can pass your filters on the next refresh (same as Include again in the player list’s excluded preview)."
+                          : undefined
+                      }
                       className={orgBtnSkyLine}
                     >
                       Include again
@@ -1119,17 +1459,26 @@ export function PlaylistOrganizer() {
                 </div>
 
                 {hasMore ? (
-                  <div className="flex w-full justify-end sm:ml-auto sm:w-auto">
-                    <button type="button" disabled={busy} onClick={() => void load(false)} className={orgBtnSkySolid}>
-                      Load more channels
+                  <div className="flex w-full flex-col items-end gap-1 sm:ml-auto sm:w-auto">
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void loadAllRemaining()}
+                      title={`Fetches all remaining pages from the server (up to ${LIMITS.MAX_CHANNELS_PER_PLAYLIST.toLocaleString()} channels in chunks of ${LIMITS.MAX_EDITOR_PAGE_SIZE.toLocaleString()}). Can take a while on large playlists.`}
+                      className={orgBtnSkySolid}
+                    >
+                      Load all channels
                     </button>
+                    <span className="max-w-xs text-right text-[10px] text-zinc-500">
+                      Replaces paging: one run pulls every row not yet loaded for this data source.
+                    </span>
                   </div>
                 ) : null}
               </div>
             </div>
             <p className="mt-3 border-t border-zinc-800/80 pt-3 text-[11px] leading-relaxed text-zinc-600">
               <span className="font-medium text-zinc-500">Reorder:</span> drag the six-dot handle on a group bar or on a channel row.
-              Group order and channel order live in your rules (auto-saved) — rebuild M3U when you want the player file to match.
+              Group order and channel order live in your rules (auto-saved) — refresh the player file when you want the hosted M3U to match.
             </p>
           </div>
         </div>
@@ -1138,7 +1487,7 @@ export function PlaylistOrganizer() {
           {groupedVisible.map(({ group, rows: gRows }) => {
             const allOn = gRows.length > 0 && gRows.every((r) => selected.has(r.id));
             const someOn = gRows.some((r) => selected.has(r.id)) && !allOn;
-            const collapsed = collapsedGroups.has(group);
+            const expanded = expandedGroups.has(group);
             return (
               <article
                 key={group}
@@ -1170,15 +1519,15 @@ export function PlaylistOrganizer() {
                       <div className="flex items-center gap-2">
                         <button
                           type="button"
-                          title={collapsed ? "Show channels in this group" : "Hide channels in this group"}
-                          aria-expanded={!collapsed}
+                          title={expanded ? "Hide channels in this group" : "Show channels in this group"}
+                          aria-expanded={expanded}
                           onClick={() => toggleGroupCollapsed(group)}
                           className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-zinc-700/80 bg-zinc-950/50 text-zinc-300 hover:border-zinc-600 hover:bg-zinc-800 hover:text-white"
                         >
                           <svg
                             viewBox="0 0 20 20"
                             fill="currentColor"
-                            className={`h-4 w-4 transition-transform duration-200 ${collapsed ? "-rotate-90" : ""}`}
+                            className={`h-4 w-4 transition-transform duration-200 ${expanded ? "" : "-rotate-90"}`}
                             aria-hidden
                           >
                             <path
@@ -1220,73 +1569,17 @@ export function PlaylistOrganizer() {
                     </span>
                   </div>
                 </div>
-                {!collapsed ? (
-                  <ul className="divide-y divide-zinc-800/90" role="list">
-                    {gRows.map((r) => (
-                      <li
-                        key={r.id}
-                        role="listitem"
-                        className={`flex gap-3 px-4 py-3 transition-colors hover:bg-zinc-800/25 ${
-                          selected.has(r.id) ? "bg-emerald-500/5 ring-1 ring-inset ring-emerald-500/25" : ""
-                        }`}
-                        onContextMenu={(e) => {
-                          e.preventDefault();
-                          setMenu({ x: e.clientX, y: e.clientY, row: r, scope: "channel", groupKey: group });
-                        }}
-                        onDragOver={(e) => {
-                          if (dragChannelRef.current?.groupKey === group) e.preventDefault();
-                        }}
-                        onDrop={(e) => {
-                          e.preventDefault();
-                          const payload = dragChannelRef.current;
-                          dragChannelRef.current = null;
-                          if (!payload || payload.groupKey !== group || payload.id === r.id) return;
-                          reorderChannelInGroup(group, payload.id, r.id);
-                        }}
-                        onDragEnd={() => {
-                          dragChannelRef.current = null;
-                        }}
-                      >
-                        <div className="flex shrink-0 items-start gap-1 pt-0.5">
-                          <span
-                            draggable
-                            title="Drag to reorder within this group"
-                            onDragStart={(ev) => {
-                              ev.stopPropagation();
-                              dragChannelRef.current = { groupKey: group, id: r.id };
-                              dragGroupRef.current = null;
-                              ev.dataTransfer.effectAllowed = "move";
-                              ev.dataTransfer.setData("text/plain", `ch:${r.id}`);
-                            }}
-                            onDragEnd={() => {
-                              dragChannelRef.current = null;
-                            }}
-                            className="mt-0.5 inline-flex cursor-grab select-none rounded-md border border-transparent p-1 text-zinc-500 hover:border-zinc-600 hover:bg-zinc-800/50 hover:text-zinc-300 active:cursor-grabbing"
-                          >
-                            <DragGripIcon />
-                          </span>
-                          <input
-                            type="checkbox"
-                            checked={selected.has(r.id)}
-                            onChange={() => toggleSel(r.id)}
-                            className="mt-1"
-                            aria-label={`Select ${r.title}`}
-                          />
-                        </div>
-                        <ChannelThumb row={r} />
-                        <div className="min-w-0 flex-1">
-                          <div className="line-clamp-2 text-sm font-medium leading-snug text-zinc-100">{r.title}</div>
-                          {r.tvgName ? <div className="mt-0.5 line-clamp-1 text-xs text-zinc-500">{r.tvgName}</div> : null}
-                          <div className="mt-1.5 break-all font-mono text-[11px] leading-relaxed text-zinc-500 lg:text-xs">
-                            {r.url}
-                          </div>
-                        </div>
-                        <div className="flex shrink-0 flex-col items-end gap-1 pt-0.5">
-                          <TabPill tab={r.tab} />
-                        </div>
-                      </li>
-                    ))}
-                  </ul>
+                {expanded ? (
+                  <VirtualGroupChannelList
+                    group={group}
+                    gRows={gRows}
+                    selected={selected}
+                    toggleSel={toggleSel}
+                    setMenu={setMenu}
+                    reorderChannelInGroup={reorderChannelInGroup}
+                    dragChannelRef={dragChannelRef}
+                    dragGroupRef={dragGroupRef}
+                  />
                 ) : (
                   <p className="px-4 py-3 text-center text-xs text-zinc-600">Collapsed — use the arrow to show channels.</p>
                 )}
@@ -1295,7 +1588,9 @@ export function PlaylistOrganizer() {
           })}
           {visible.length === 0 && !busy && (
             <p className="rounded-2xl border border-zinc-800 bg-zinc-900/40 py-12 text-center text-sm text-zinc-500">
-              No channels match this tab or search.
+              {editorDataSet === "rulesDropped" && total === 0
+                ? "No “hidden by rules” snapshot for this playlist yet. Run “Refresh player file from sources” once so the server can write it, or your rules may not have removed any channels on the last run."
+                : "No channels match this tab or search."}
             </p>
           )}
         </div>
@@ -1304,11 +1599,13 @@ export function PlaylistOrganizer() {
           Use the group bar checkbox to select every channel in that group, or pick channels in the list. Right-click a
           channel row or <strong className="font-normal text-zinc-500">group bar</strong> for filters, order (move to top), or use{" "}
           <strong className="font-normal text-zinc-500">Add a rule</strong> under Playlist tools. Drag the grip handle on a group or
-          channel to reorder; rules save automatically, then <strong className="font-normal text-zinc-500">rebuild</strong> so the
-          player file matches.
-          {showExcluded
-            ? " With excluded rows visible, “Include selected again” adds name/URL allow patterns for the selection — rebuild when ready."
-            : ""}
+          channel to reorder; rules save automatically, then <strong className="font-normal text-zinc-500">refresh the player file</strong>{" "}
+          so the hosted M3U matches.
+          {editorDataSet === "player" && showExcluded
+            ? " With excluded rows visible, “Include selected again” adds name/URL allow patterns for the selection — refresh the player file when ready."
+            : editorDataSet === "rulesDropped"
+              ? " On “Hidden by rules”, select rows and use Include again to add allow patterns, or edit excludes under Add a rule — then refresh the player file so apps pick up changes."
+              : ""}
         </p>
         </div>
       </div>
