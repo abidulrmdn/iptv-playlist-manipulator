@@ -23,9 +23,15 @@ for (const p of [path.join(process.cwd(), ".env"), path.join(process.cwd(), "fun
 
 initializeApp();
 const db = getFirestore();
-const bucket = getStorage().bucket();
+const bucket = getStorage().bucket(); // Gen2 HTTPS + scheduler (invoker public + IAM binding in predeploy).
 
-setGlobalOptions({ region: "us-central1", maxInstances: 5 });
+// Gen2 = Cloud Run. Callables send a Firebase ID token, not a Google OIDC token; Cloud Run must allow
+// unauthenticated invocation at the edge, while requireAuth() / CallableRequest.auth enforce Firebase Auth.
+// Global + per-function invoker (some deploy paths only apply per-function IAM).
+setGlobalOptions({ region: "us-central1", maxInstances: 5, invoker: "public" });
+
+/** Merge into every HTTPS / scheduled function so Cloud Run grants unauthenticated invoke at the edge. */
+const RUN_INVOKER_PUBLIC = { invoker: "public" as const };
 
 /**
  * Secret Manager id (must not match `ENCRYPTION_KEY` in functions/.env — Firebase would reject
@@ -57,9 +63,13 @@ async function countUserPlaylists(uid: string): Promise<number> {
   return snap.size;
 }
 
-export const upsertSource = onCall({ secrets: [encryptionKeySecret] }, async (request) => {
+export const upsertSource = onCall({ ...RUN_INVOKER_PUBLIC, secrets: [encryptionKeySecret] }, async (request) => {
   requireAuth(request.auth?.uid);
   const uid = request.auth!.uid;
+  console.info("[upsertSource] entry", {
+    hasIptvKey: Boolean(process.env.IPTV_ENCRYPTION_KEY?.trim()),
+    hasEnvKey: Boolean(process.env.ENCRYPTION_KEY?.trim()),
+  });
   const label = String(request.data?.label ?? "").slice(0, LIMITS.MAX_LABEL_LENGTH);
   const url = String(request.data?.url ?? "");
   if (!url || url.length > LIMITS.MAX_SOURCE_URL_LENGTH) {
@@ -69,69 +79,78 @@ export const upsertSource = onCall({ secrets: [encryptionKeySecret] }, async (re
     throw new HttpsError("invalid-argument", "URL must be http(s)");
   }
 
-  const count = await countUserSources(uid);
-  if (count >= LIMITS.MAX_SOURCES_PER_USER) {
-    throw new HttpsError("resource-exhausted", "Source limit reached");
-  }
-
-  let urlEnc: ReturnType<typeof encryptUtf8>;
   try {
-    urlEnc = encryptUtf8(url);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    const inEmu = process.env.FUNCTIONS_EMULATOR === "true";
-    if (msg.includes("ENCRYPTION_KEY") || msg.includes("IPTV_ENCRYPTION_KEY")) {
+    const count = await countUserSources(uid);
+    if (count >= LIMITS.MAX_SOURCES_PER_USER) {
+      throw new HttpsError("resource-exhausted", "Source limit reached");
+    }
+
+    let urlEnc: ReturnType<typeof encryptUtf8>;
+    try {
+      urlEnc = encryptUtf8(url);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const inEmu = process.env.FUNCTIONS_EMULATOR === "true";
+      if (msg.includes("ENCRYPTION_KEY") || msg.includes("IPTV_ENCRYPTION_KEY")) {
+        throw new HttpsError(
+          "failed-precondition",
+          inEmu
+            ? "Encryption key is missing or invalid. Set ENCRYPTION_KEY in functions/.env (openssl rand -base64 32), then restart the emulators."
+            : "Server encryption is not configured: set Secret IPTV_ENCRYPTION_KEY (same value as ENCRYPTION_KEY in docs) with firebase functions:secrets:set, then redeploy.",
+        );
+      }
+      console.error("upsertSource encrypt error", err);
       throw new HttpsError(
         "failed-precondition",
         inEmu
-          ? "Encryption key is missing or invalid. Set ENCRYPTION_KEY in functions/.env (openssl rand -base64 32), then restart the emulators."
-          : "Server encryption is not configured: set Secret IPTV_ENCRYPTION_KEY (same value as ENCRYPTION_KEY in docs) with firebase functions:secrets:set, then redeploy.",
+          ? "Could not encrypt the source URL. Check the Functions emulator logs and ENCRYPTION_KEY in functions/.env."
+          : "Could not encrypt the source URL. Check Cloud Functions logs and the IPTV_ENCRYPTION_KEY secret.",
       );
     }
-    console.error("upsertSource encrypt error", err);
-    throw new HttpsError(
-      "failed-precondition",
-      inEmu
-        ? "Could not encrypt the source URL. Check the Functions emulator logs and ENCRYPTION_KEY in functions/.env."
-        : "Could not encrypt the source URL. Check Cloud Functions logs and ENCRYPTION_KEY on the deployed service.",
-    );
-  }
 
-  const id = String(request.data?.id ?? "");
-  try {
-    if (id) {
-      const ref = db.collection("sources").doc(id);
-      const snap = await ref.get();
-      if (!snap.exists || (snap.data() as { ownerUid?: string }).ownerUid !== uid) {
-        throw new HttpsError("not-found", "Source not found");
+    const id = String(request.data?.id ?? "");
+    try {
+      if (id) {
+        const ref = db.collection("sources").doc(id);
+        const snap = await ref.get();
+        if (!snap.exists || (snap.data() as { ownerUid?: string }).ownerUid !== uid) {
+          throw new HttpsError("not-found", "Source not found");
+        }
+        await ref.update({
+          label,
+          urlEnc,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        return { id };
       }
-      await ref.update({
-        label,
-        urlEnc,
-        updatedAt: FieldValue.serverTimestamp(),
-      });
-      return { id };
-    }
 
-    const ref = db.collection("sources").doc();
-    await ref.set({
-      ownerUid: uid,
-      label: label || "Source",
-      urlEnc,
-      createdAt: FieldValue.serverTimestamp(),
-    });
-    return { id: ref.id };
+      const ref = db.collection("sources").doc();
+      await ref.set({
+        ownerUid: uid,
+        label: label || "Source",
+        urlEnc,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+      return { id: ref.id };
+    } catch (e) {
+      if (e instanceof HttpsError) throw e;
+      console.error("upsertSource Firestore error", e);
+      throw new HttpsError(
+        "failed-precondition",
+        "Could not save the source. Check Functions logs and Firestore status.",
+      );
+    }
   } catch (e) {
     if (e instanceof HttpsError) throw e;
-    console.error("upsertSource Firestore error", e);
+    console.error("upsertSource unexpected error", e);
     throw new HttpsError(
       "failed-precondition",
-      "Could not save the source. Check Functions logs and Firestore status.",
+      "Could not add this source. In Firebase Console open Functions → upsertSource → Logs. If you deploy from CI, set Secret IPTV_ENCRYPTION_KEY to the same base64 key as in functions/.env, then redeploy.",
     );
   }
 });
 
-export const deleteSource = onCall(async (request) => {
+export const deleteSource = onCall(RUN_INVOKER_PUBLIC, async (request) => {
   requireAuth(request.auth?.uid);
   const uid = request.auth!.uid;
   const id = String(request.data?.id ?? "");
@@ -145,7 +164,7 @@ export const deleteSource = onCall(async (request) => {
   return { ok: true };
 });
 
-export const createPlaylist = onCall(async (request) => {
+export const createPlaylist = onCall(RUN_INVOKER_PUBLIC, async (request) => {
   requireAuth(request.auth?.uid);
   const uid = request.auth!.uid;
   if ((await countUserPlaylists(uid)) >= LIMITS.MAX_PLAYLISTS_PER_USER) {
@@ -183,7 +202,7 @@ export const createPlaylist = onCall(async (request) => {
   return { id: ref.id, publicToken };
 });
 
-export const updatePlaylist = onCall(async (request) => {
+export const updatePlaylist = onCall(RUN_INVOKER_PUBLIC, async (request) => {
   requireAuth(request.auth?.uid);
   const uid = request.auth!.uid;
   const id = String(request.data?.id ?? "");
@@ -220,7 +239,7 @@ export const updatePlaylist = onCall(async (request) => {
 });
 
 export const refreshPlaylist = onCall(
-  { memory: "1GiB", timeoutSeconds: 540, secrets: [encryptionKeySecret] },
+  { ...RUN_INVOKER_PUBLIC, memory: "1GiB", timeoutSeconds: 540, secrets: [encryptionKeySecret] },
   async (request) => {
     requireAuth(request.auth?.uid);
     const uid = request.auth!.uid;
@@ -250,7 +269,7 @@ export const refreshPlaylist = onCall(
   },
 );
 
-export const getDiffSummary = onCall(async (request) => {
+export const getDiffSummary = onCall(RUN_INVOKER_PUBLIC, async (request) => {
   requireAuth(request.auth?.uid);
   const uid = request.auth!.uid;
   const playlistId = String(request.data?.playlistId ?? "");
@@ -267,7 +286,9 @@ export const getDiffSummary = onCall(async (request) => {
 });
 
 /** Paginated channel rows + rules for the visual playlist organizer (auth). */
-export const getPlaylistEditorData = onCall({ memory: "512MiB", timeoutSeconds: 120 }, async (request) => {
+export const getPlaylistEditorData = onCall(
+  { ...RUN_INVOKER_PUBLIC, memory: "512MiB", timeoutSeconds: 120 },
+  async (request) => {
   requireAuth(request.auth?.uid);
   const uid = request.auth!.uid;
   const playlistId = String(request.data?.playlistId ?? "");
@@ -336,7 +357,9 @@ export const getPlaylistEditorData = onCall({ memory: "512MiB", timeoutSeconds: 
 });
 
 /** All canonical channel ids for the organizer “select entire playlist” action (auth; re-reads Storage M3U). */
-export const getPlaylistEditorChannelIds = onCall({ memory: "512MiB", timeoutSeconds: 120 }, async (request) => {
+export const getPlaylistEditorChannelIds = onCall(
+  { ...RUN_INVOKER_PUBLIC, memory: "512MiB", timeoutSeconds: 120 },
+  async (request) => {
   requireAuth(request.auth?.uid);
   const uid = request.auth!.uid;
   const playlistId = String(request.data?.playlistId ?? "");
@@ -372,7 +395,9 @@ export const getPlaylistEditorChannelIds = onCall({ memory: "512MiB", timeoutSec
  * Adds exclude-by-exact-name patterns for every selected channel id by reading the full generated M3U
  * (same source as “Entire playlist” selection). Use when the selection includes ids not loaded in the editor table.
  */
-export const bulkExcludeByNamesForChannelIds = onCall({ memory: "512MiB", timeoutSeconds: 120 }, async (request) => {
+export const bulkExcludeByNamesForChannelIds = onCall(
+  { ...RUN_INVOKER_PUBLIC, memory: "512MiB", timeoutSeconds: 120 },
+  async (request) => {
   requireAuth(request.auth?.uid);
   const uid = request.auth!.uid;
   const playlistId = String(request.data?.playlistId ?? "");
@@ -478,7 +503,7 @@ export const bulkExcludeByNamesForChannelIds = onCall({ memory: "512MiB", timeou
 });
 
 /** Public M3U for IPTV players (no auth). Use `?token=<publicToken>` or path ending in token.m3u */
-export const publicPlaylist = onRequest({ cors: false, memory: "512MiB" }, async (req, res) => {
+export const publicPlaylist = onRequest({ ...RUN_INVOKER_PUBLIC, cors: false, memory: "512MiB" }, async (req, res) => {
   const url = new URL(req.url, "http://localhost");
   let token = url.searchParams.get("token") ?? "";
   if (!token) {
@@ -529,6 +554,7 @@ export const publicPlaylist = onRequest({ cors: false, memory: "512MiB" }, async
 /** Weekly refresh window (MVP plan): Mondays 09:00 UTC; cost-capped batch (15 playlists max per run). */
 export const scheduledPlaylistRefresh = onSchedule(
   {
+    ...RUN_INVOKER_PUBLIC,
     schedule: "0 9 * * 1",
     timeZone: "Etc/UTC",
     memory: "1GiB",
@@ -561,7 +587,7 @@ export const scheduledPlaylistRefresh = onSchedule(
 );
 
 /** Callable: rotate public token (invalidates old player URL). */
-export const deletePlaylist = onCall(async (request) => {
+export const deletePlaylist = onCall(RUN_INVOKER_PUBLIC, async (request) => {
   requireAuth(request.auth?.uid);
   const uid = request.auth!.uid;
   const playlistId = String(request.data?.playlistId ?? "");
@@ -581,7 +607,7 @@ export const deletePlaylist = onCall(async (request) => {
   return { ok: true };
 });
 
-export const rotatePlaylistToken = onCall(async (request) => {
+export const rotatePlaylistToken = onCall(RUN_INVOKER_PUBLIC, async (request) => {
   requireAuth(request.auth?.uid);
   const uid = request.auth!.uid;
   const playlistId = String(request.data?.playlistId ?? "");

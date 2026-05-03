@@ -8,6 +8,7 @@
   "scripts": {
     "build": "tsc",
     "build:watch": "tsc --watch",
+    "ensure-run-invoker": "bash scripts/ensure-cloud-run-invoker-public.sh",
     "serve": "npm run build && firebase emulators:start --only functions",
     "lint": "eslint src/"
   },

@@ -21,7 +21,7 @@ These limits match the **IPTV Middleware MVP** product requirement: *hard caps s
 - **Callable `refreshPlaylist`:** Gen2 — **540s** timeout, **1 GiB** memory (`functions/src/index.ts`).
 - **Scheduled batch:** at most **15** playlists per scheduler run (`limit(15)` query).
 - **Manual refresh:** same `runPlaylistRefresh` path as scheduled.
-- **Upstream fetch:** retries on transient HTTP/network errors; alternate **browser-like User-Agent** if the first profile fails; response must look like **M3U** (`#EXTM3U`), not HTML (captures wrong URLs / captive portals). Non-standard HTTP status codes (e.g. some proxies) produce an explicit error hint.
+- **Upstream fetch:** retries on transient HTTP/network errors; alternate **browser-like User-Agent** if the first profile fails; response must look like **M3U** (`#EXTM3U`), not HTML (captures wrong URLs / captive portals). Non-standard HTTP status codes are accepted **only if** the body still validates as M3U (some IPTV panels use custom codes such as 884 with a valid playlist).
 
 ## Enforcement locations
 

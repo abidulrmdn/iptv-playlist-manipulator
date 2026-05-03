@@ -28,6 +28,10 @@ type WindowWithOob = Window & { [EMAIL_LINK_OOB_GLOBAL]?: string };
 
 function formatFunctionsDetails(details: unknown): string | undefined {
   if (typeof details === "string" && details.trim()) return details.trim();
+  if (details && typeof details === "object" && "message" in details && typeof (details as { message: unknown }).message === "string") {
+    const m = (details as { message: string }).message.trim();
+    if (m) return m;
+  }
   if (Array.isArray(details)) {
     const parts = details
       .map((d) => {
@@ -43,9 +47,16 @@ function formatFunctionsDetails(details: unknown): string | undefined {
   return undefined;
 }
 
+function formatFunctionsCustomData(customData: unknown): string | undefined {
+  if (!customData || typeof customData !== "object") return undefined;
+  const o = customData as Record<string, unknown>;
+  if (typeof o.message === "string" && o.message.trim()) return o.message.trim();
+  return undefined;
+}
+
 function clientErrorMessage(e: unknown): string {
   if (e instanceof Error) {
-    const fe = e as Error & { code?: string; details?: unknown };
+    const fe = e as Error & { code?: string; details?: unknown; customData?: unknown };
     const code = fe.code ?? "";
     if (code === "functions/deadline-exceeded") {
       return "That operation timed out (the server can take several minutes to download large M3Us). Try again, or use shorter source playlists.";
@@ -54,13 +65,15 @@ function clientErrorMessage(e: unknown): string {
     if (msg && !/^internal$/i.test(msg) && msg !== "deadline-exceeded") return msg;
     const fromDetails = formatFunctionsDetails(fe.details);
     if (fromDetails) return fromDetails;
+    const fromCustom = formatFunctionsCustomData(fe.customData);
+    if (fromCustom) return fromCustom;
     if (code.startsWith("functions/")) {
       const c = code.replace(/^functions\//, "");
       if (/^internal$/i.test(c)) {
         const onFnEmu = import.meta.env.DEV && import.meta.env.VITE_USE_EMULATOR === "true";
         return onFnEmu
           ? "Server error — check the Functions emulator terminal (common fix: valid ENCRYPTION_KEY in functions/.env, then restart emulators)."
-          : "Server error — open Firebase Console → Functions → Logs for details. If you deploy from CI, ensure ENCRYPTION_KEY is set on the Cloud Functions runtime (not only on your laptop).";
+          : "Server error — Gen2 callables run on Cloud Run. If Logs show “not authenticated” / empty Authorization, redeploy from this repo (invoker: public + predeploy IAM script) or run: npm run ensure-run-invoker -w functions (after gcloud auth). Also ensure you are signed in; then check Functions → Logs. Secret IPTV_ENCRYPTION_KEY is only needed for encryption errors, not for this IAM case.";
       }
       return c.replace(/-/g, " ");
     }
@@ -247,23 +260,41 @@ export function App() {
       return;
     }
     const q1 = query(collection(db, "sources"), where("ownerUid", "==", user.uid), orderBy("createdAt", "desc"));
-    const unsub1 = onSnapshot(q1, (snap) => {
-      setSources(
-        snap.docs.map((d) => {
-          const x = d.data() as { label?: string };
-          return { id: d.id, label: x.label ?? "", createdAt: (d.data() as { createdAt?: { seconds?: number } }).createdAt };
-        }),
-      );
-    });
+    const unsub1 = onSnapshot(
+      q1,
+      (snap) => {
+        setSources(
+          snap.docs.map((d) => {
+            const x = d.data() as { label?: string };
+            return { id: d.id, label: x.label ?? "", createdAt: (d.data() as { createdAt?: { seconds?: number } }).createdAt };
+          }),
+        );
+      },
+      (err) => {
+        console.error("sources snapshot", err);
+        setToast(
+          `Could not load sources (${err.message}). If this mentions an index, deploy Firestore indexes and wait until they finish building.`,
+        );
+        setTimeout(() => setToast(null), 6200);
+      },
+    );
     const q2 = query(collection(db, "playlists"), where("ownerUid", "==", user.uid), orderBy("updatedAt", "desc"));
-    const unsub2 = onSnapshot(q2, (snap) => {
-      setPlaylists(
-        snap.docs.map((d) => {
-          const x = d.data() as Omit<PlaylistRow, "id">;
-          return { id: d.id, ...x };
-        }),
-      );
-    });
+    const unsub2 = onSnapshot(
+      q2,
+      (snap) => {
+        setPlaylists(
+          snap.docs.map((d) => {
+            const x = d.data() as Omit<PlaylistRow, "id">;
+            return { id: d.id, ...x };
+          }),
+        );
+      },
+      (err) => {
+        console.error("playlists snapshot", err);
+        setToast(`Could not load playlists (${err.message}).`);
+        setTimeout(() => setToast(null), 6200);
+      },
+    );
     return () => {
       unsub1();
       unsub2();
@@ -355,9 +386,18 @@ export function App() {
 
   const addSource = () =>
     run(async () => {
+      const u = auth.currentUser;
+      if (!u) throw new Error("You are not signed in (or the session expired). Refresh the page and sign in again.");
+      await u.getIdToken();
+      const label = srcLabel.trim() || "Source";
+      const url = srcUrl.trim();
       const upsert = callable<{ label: string; url: string }, { id: string }>("upsertSource");
-      await upsert({ label: srcLabel.trim() || "Source", url: srcUrl.trim() });
+      const { data } = await upsert({ label, url });
       setSrcUrl("");
+      setSources((prev) => {
+        if (prev.some((s) => s.id === data.id)) return prev;
+        return [{ id: data.id, label, createdAt: { seconds: Math.floor(Date.now() / 1000) } }, ...prev];
+      });
       notify("Source added (URL encrypted server-side)");
     });
 
