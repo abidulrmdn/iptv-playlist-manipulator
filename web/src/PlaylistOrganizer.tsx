@@ -383,6 +383,8 @@ export function PlaylistOrganizer() {
     series: number;
   } | null>(null);
   const editorFetchGen = useRef(0);
+  /** When true, first page loads but further pages are not auto-fetched (e.g. after refreshPlaylist). */
+  const suppressEditorAutoHydrateRef = useRef(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
   const [menu, setMenu] = useState<ContextMenuState | null>(null);
@@ -470,11 +472,31 @@ export function PlaylistOrganizer() {
   const load = useCallback(
     async (reset: boolean) => {
       if (!playlistId || !user) return;
-      if (reset) loadedThroughRef.current = 0;
-      const gen = ++editorFetchGen.current;
-      setBusy(true);
+      if (reset) {
+        loadedThroughRef.current = 0;
+        editorFetchGen.current += 1;
+        setBusy(true);
+      }
+      const session = editorFetchGen.current;
+      let d:
+        | {
+            name: string;
+            publicToken: string;
+            rules: PlaylistRules;
+            channels: EditorRow[];
+            total: number;
+            offset: number;
+            limit: number;
+            hasMore: boolean;
+            enrichEnabled: boolean;
+            duplicateNewIntoLatest: boolean;
+            dataSet?: string;
+            rulesDroppedAvailable?: boolean;
+            totalsByTab?: { all: number; tv: number; movie: number; series: number };
+          }
+        | null = null;
       try {
-        rulesSaveGeneration.current += 1;
+        if (reset) rulesSaveGeneration.current += 1;
         const off = reset ? 0 : loadedThroughRef.current;
         const fn = callable<
           {
@@ -509,8 +531,8 @@ export function PlaylistOrganizer() {
           ...(serverQuery ? { search: serverQuery } : {}),
           ...(tab !== "all" ? { tab } : {}),
         });
-        if (gen !== editorFetchGen.current) return;
-        const d = r.data;
+        if (session !== editorFetchGen.current) return;
+        d = r.data;
         skipNextRulesAutosave.current = true;
         setName(d.name);
         setPublicToken(d.publicToken ?? "");
@@ -523,17 +545,30 @@ export function PlaylistOrganizer() {
         loadedThroughRef.current = d.offset + d.channels.length;
         startTransition(() => {
           setRows((prev) => {
-            if (reset) return d.channels;
+            if (reset) return d!.channels;
             const seen = new Set(prev.map((x) => x.id));
-            const add = d.channels.filter((c) => !seen.has(c.id));
+            const add = d!.channels.filter((c) => !seen.has(c.id));
             return [...prev, ...add];
           });
         });
       } catch (e) {
         notify(errMsg(e));
       } finally {
-        if (gen === editorFetchGen.current) setBusy(false);
+        if (reset && session === editorFetchGen.current) setBusy(false);
       }
+      if (
+        !d ||
+        !d.hasMore ||
+        session !== editorFetchGen.current ||
+        suppressEditorAutoHydrateRef.current
+      ) {
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => resolve());
+      });
+      if (session !== editorFetchGen.current || suppressEditorAutoHydrateRef.current) return;
+      await load(false);
     },
     [playlistId, user, notify, editorDataSet, serverQuery, tab],
   );
@@ -541,6 +576,7 @@ export function PlaylistOrganizer() {
   /** Fetches every remaining page from the current offset until the server reports no more rows. */
   const loadAllRemaining = useCallback(async () => {
     if (!playlistId || !user) return;
+    editorFetchGen.current += 1;
     const snapshotGen = editorFetchGen.current;
     setBusy(true);
     const maxPages = Math.ceil(LIMITS.MAX_CHANNELS_PER_PLAYLIST / LIMITS.MAX_EDITOR_PAGE_SIZE) + 2;
@@ -842,7 +878,12 @@ export function PlaylistOrganizer() {
       });
       await fn({ playlistId });
       notify("Player file updated — reloading this table from the server…");
-      await load(true);
+      suppressEditorAutoHydrateRef.current = true;
+      try {
+        await load(true);
+      } finally {
+        suppressEditorAutoHydrateRef.current = false;
+      }
     } catch (e) {
       notify(errMsg(e));
     } finally {
@@ -1301,6 +1342,9 @@ export function PlaylistOrganizer() {
           <span className="ml-auto text-xs text-zinc-500">
             Loaded {rows.length.toLocaleString()} / {total.toLocaleString()}{" "}
             {editorDataSet === "rulesDropped" ? "hidden rows" : "rows"}
+            {!busy && hasMore && rows.length < total ? (
+              <span className="text-sky-400/90"> · loading more in the background…</span>
+            ) : null}
             {editorDataSet === "player" && excludedCount > 0 && !showExcluded ? ` · ${excludedCount} hidden by rules (preview)` : ""}
             {editorDataSet === "player" && showExcluded ? " · showing rules preview (excluded only)" : ""}
             {editorDataSet === "rulesDropped" ? " · last refresh snapshot" : ""}
@@ -1508,7 +1552,7 @@ export function PlaylistOrganizer() {
                       Load all channels
                     </button>
                     <span className="max-w-xs text-right text-[10px] text-zinc-500">
-                      Uses the same server filter as the search box and TV / Movies / Series tab.
+                      The table usually fills automatically; this pulls the rest in one go with the same search and tab filter.
                     </span>
                   </div>
                 ) : null}
