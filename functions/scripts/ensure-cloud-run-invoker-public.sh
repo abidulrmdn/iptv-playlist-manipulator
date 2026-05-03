@@ -25,6 +25,7 @@ SERVICES=(
   getdiffsummary
   getplaylisteditordata
   getplaylisteditorchannelids
+  editorhydrationtick
   bulkexcludebynamesforchannelids
   publicplaylist
   scheduledplaylistrefresh
