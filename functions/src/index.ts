@@ -376,6 +376,10 @@ export const getPlaylistEditorData = onCall(
   const limit = Math.min(LIMITS.MAX_EDITOR_PAGE_SIZE, Math.max(50, limitRaw));
   const dataSetRaw = String((request.data as { dataSet?: unknown })?.dataSet ?? "player").trim().toLowerCase();
   const dataSet = dataSetRaw === "rulesdropped" || dataSetRaw === "rules_dropped" ? "rulesDropped" : "player";
+  const tabRaw = String((request.data as { tab?: unknown })?.tab ?? "all").trim().toLowerCase();
+  const tabFilter = tabRaw === "tv" || tabRaw === "movie" || tabRaw === "series" ? tabRaw : "all";
+  const searchRaw = String((request.data as { search?: unknown })?.search ?? "").trim();
+  const searchNeedle = searchRaw.slice(0, LIMITS.MAX_EDITOR_SEARCH_CHARS).toLowerCase();
 
   const snap = await db.collection("playlists").doc(playlistId).get();
   if (!snap.exists || (snap.data() as { ownerUid?: string }).ownerUid !== uid) {
@@ -414,6 +418,7 @@ export const getPlaylistEditorData = onCall(
         duplicateNewIntoLatest: data.duplicateNewIntoLatest !== false,
         dataSet: "rulesDropped",
         rulesDroppedAvailable: false,
+        totalsByTab: { all: 0, tv: 0, movie: 0, series: 0 },
       };
     }
     throw new HttpsError(
@@ -429,8 +434,31 @@ export const getPlaylistEditorData = onCall(
   }
 
   const all = parseM3u(text);
-  const total = all.length;
-  const slice = all.slice(offset, offset + limit);
+  let totalTv = 0;
+  let totalMovie = 0;
+  let totalSeries = 0;
+  for (const ch of all) {
+    const t = classifyEditorTab(ch);
+    if (t === "tv") totalTv++;
+    else if (t === "movie") totalMovie++;
+    else totalSeries++;
+  }
+  const totalsByTab = { all: all.length, tv: totalTv, movie: totalMovie, series: totalSeries };
+
+  let working = all;
+  if (tabFilter !== "all") {
+    working = working.filter((ch) => classifyEditorTab(ch) === tabFilter);
+  }
+  if (searchNeedle.length > 0) {
+    working = working.filter((ch) => {
+      const title = ch.title.toLowerCase();
+      const group = (ch.groupTitle ?? "").toLowerCase();
+      const url = ch.url.toLowerCase();
+      return title.includes(searchNeedle) || group.includes(searchNeedle) || url.includes(searchNeedle);
+    });
+  }
+  const total = working.length;
+  const slice = working.slice(offset, offset + limit);
 
   const channels = slice.map((ch) => ({
     id: canonicalId(ch),
@@ -456,6 +484,7 @@ export const getPlaylistEditorData = onCall(
     duplicateNewIntoLatest: data.duplicateNewIntoLatest !== false,
     dataSet,
     rulesDroppedAvailable: dataSet === "rulesDropped" ? true : undefined,
+    totalsByTab,
   };
 });
 

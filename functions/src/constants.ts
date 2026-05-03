@@ -69,6 +69,8 @@ export const LIMITS = {
   SNAPSHOTS_RETAINED: 3,
   /** Max channels returned per getPlaylistEditorData page (UX vs payload size). */
   MAX_EDITOR_PAGE_SIZE: 6_000,
+  /** Max characters accepted for `getPlaylistEditorData` substring search (cost / abuse). */
+  MAX_EDITOR_SEARCH_CHARS: 200,
   /** Cap stored manual channel ordering (Firestore size / UX). */
   MAX_CHANNEL_ORDER_ENTRIES: 10_000,
 } as const;
