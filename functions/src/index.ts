@@ -313,6 +313,18 @@ export const updatePlaylist = onCall(RUN_INVOKER_PUBLIC, async (request) => {
   if (request.data?.duplicateNewIntoLatest != null) {
     patch.duplicateNewIntoLatest = Boolean(request.data.duplicateNewIntoLatest);
   }
+  if (request.data?.maxChannelsToLoad !== undefined) {
+    const raw = (request.data as { maxChannelsToLoad?: unknown }).maxChannelsToLoad;
+    if (raw === null) {
+      patch.maxChannelsToLoad = FieldValue.delete();
+    } else {
+      const n = Math.floor(Number(raw));
+      if (!Number.isFinite(n) || n < 1) {
+        throw new HttpsError("invalid-argument", "maxChannelsToLoad must be null or an integer >= 1");
+      }
+      patch.maxChannelsToLoad = Math.min(LIMITS.MAX_CHANNELS_PER_PLAYLIST, n);
+    }
+  }
 
   await ref.update(patch);
   return { ok: true };

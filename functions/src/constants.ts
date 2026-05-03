@@ -39,7 +39,7 @@ export const LIMITS = {
   MAX_SOURCES_PER_USER: 12,
   MAX_PLAYLISTS_PER_USER: 15,
   MAX_CHANNELS_PER_PLAYLIST: 500_000,
-  MAX_M3U_BYTES: 45 * 1024 * 1024,
+  MAX_M3U_BYTES: 70 * 1024 * 1024,
   MAX_SOURCE_URL_LENGTH: 4096,
   /** Xtream panel base URL (scheme + host + optional port only, normalized server-side). */
   MAX_XTREAM_BASE_URL_LENGTH: 512,
@@ -48,7 +48,7 @@ export const LIMITS = {
   /** Per `player_api.php` HTTP call (categories / streams). */
   XTREAM_HTTP_TIMEOUT_MS: 120_000,
   /** Max JSON body per Xtream API response (live/VOD list payloads). */
-  XTREAM_MAX_API_RESPONSE_BYTES: 45 * 1024 * 1024,
+  XTREAM_MAX_API_RESPONSE_BYTES: 70 * 1024 * 1024,
   /**
    * Max per-category `get_*_streams` HTTP calls per refresh phase (live, then VOD).
    * Stops early once `MAX_CHANNELS_PER_PLAYLIST` rows are collected; this is only a safety ceiling.
@@ -80,6 +80,14 @@ export const LIMITS = {
   /** Cap stored manual channel ordering (Firestore size / UX). */
   MAX_CHANNEL_ORDER_ENTRIES: 10_000,
 } as const;
+
+/** Max merged channel rows for one playlist when Firestore omits `maxChannelsToLoad` or value is invalid. */
+export function effectiveMaxChannelsForPlaylist(stored: unknown): number {
+  if (stored == null) return LIMITS.MAX_CHANNELS_PER_PLAYLIST;
+  const n = typeof stored === "number" ? stored : Math.floor(Number(stored));
+  if (!Number.isFinite(n) || n < 1) return LIMITS.MAX_CHANNELS_PER_PLAYLIST;
+  return Math.min(LIMITS.MAX_CHANNELS_PER_PLAYLIST, Math.floor(n));
+}
 
 export const DEFAULT_RULES: PlaylistRules = {
   dedupe: true,

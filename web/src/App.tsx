@@ -18,6 +18,7 @@ import {
   publicPlaylistUrl,
 } from "./firebase";
 import { formatRefreshProgressLine, type PlaylistRefreshProgress } from "./refreshProgressFormat";
+import { LIMITS, effectiveMaxChannelsForPlaylist } from "../../functions/src/constants";
 
 const DEV_TEST_EMAIL = "test@test.com";
 
@@ -106,6 +107,8 @@ type PlaylistRow = {
   rules: Record<string, unknown>;
   enrichEnabled?: boolean;
   duplicateNewIntoLatest?: boolean;
+  /** Omit or unset = use full server cap (`MAX_CHANNELS_PER_PLAYLIST`). */
+  maxChannelsToLoad?: number;
   channelCount?: number;
   etag?: string;
   lastError?: string;
@@ -171,15 +174,15 @@ export function App() {
 
   const [srcLabel, setSrcLabel] = useState("");
   const [srcKind, setSrcKind] = useState<"m3u" | "xtream">("m3u");
-  const [srcUrl, setSrcUrl] = useState("");
-  const [xtBase, setXtBase] = useState("");
-  const [xtUser, setXtUser] = useState("");
-  const [xtPass, setXtPass] = useState("");
-  /** Password managers / autofill often skip `onChange`; refs capture real DOM values on submit. */
+  /**
+   * Provider URLs and Xtream creds use uncontrolled inputs + refs so password managers / autofill
+   * cannot get wiped by React controlled `value=""` reconciliation (classic “filled but stuck” bug).
+   */
   const srcUrlInputRef = useRef<HTMLInputElement>(null);
   const xtBaseInputRef = useRef<HTMLInputElement>(null);
   const xtUserInputRef = useRef<HTMLInputElement>(null);
   const xtPassInputRef = useRef<HTMLInputElement>(null);
+  const sourceAddInFlightRef = useRef(false);
 
   const [plName, setPlName] = useState("My playlist");
   const [plSources, setPlSources] = useState<string[]>([]);
@@ -190,6 +193,8 @@ export function App() {
   const [rulesJson, setRulesJson] = useState(defaultRulesJson);
   const [enrich, setEnrich] = useState(false);
   const [dupLatest, setDupLatest] = useState(true);
+  /** Local digits for optional refresh cap; empty = server default (full `MAX_CHANNELS_PER_PLAYLIST`). */
+  const [maxChannelsDraft, setMaxChannelsDraft] = useState("");
   /** `undefined` = not loaded; `null` = no diff file yet; else parsed summary from Storage. */
   const [diffSummary, setDiffSummary] = useState<DiffSummary | null | undefined>(undefined);
   const [diffLoading, setDiffLoading] = useState(false);
@@ -365,6 +370,12 @@ export function App() {
     setRulesJson(JSON.stringify(selected.rules ?? JSON.parse(defaultRulesJson), null, 2));
     setEnrich(Boolean(selected.enrichEnabled));
     setDupLatest(selected.duplicateNewIntoLatest !== false);
+    const cap = selected.maxChannelsToLoad;
+    setMaxChannelsDraft(
+      cap != null && Number.isFinite(cap) && cap >= 1 && cap <= LIMITS.MAX_CHANNELS_PER_PLAYLIST
+        ? String(Math.floor(cap))
+        : "",
+    );
   }, [selectedPl, selected]);
 
   useEffect(() => {
@@ -436,12 +447,18 @@ export function App() {
   const logout = () => signOut(auth);
 
   const addSource = () => {
+    if (sourceAddInFlightRef.current) return;
+    sourceAddInFlightRef.current = true;
+    setSourceSubmitting(true);
     void (async () => {
-      setSourceSubmitting(true);
       try {
         const u = auth.currentUser;
         if (!u) throw new Error("You are not signed in (or the session expired). Refresh the page and sign in again.");
-        await u.getIdToken();
+        const tokenMs = 25_000;
+        await Promise.race([
+          u.getIdToken(),
+          new Promise<never>((_, rej) => setTimeout(() => rej(new Error("Auth token request timed out — check your network and try again.")), tokenMs)),
+        ]);
         const label = srcLabel.trim() || "Source";
         const upsert = callable<
           {
@@ -457,16 +474,16 @@ export function App() {
         let kind: SourceRow["kind"] = "m3u";
         let data: { id: string };
         if (srcKind === "m3u") {
-          const url = (srcUrlInputRef.current?.value ?? srcUrl).trim();
+          const url = (srcUrlInputRef.current?.value ?? "").trim();
           if (!url) throw new Error("Enter a playlist URL");
           const r = await upsert({ label, sourceType: "m3u", url });
           data = r.data;
-          setSrcUrl("");
+          if (srcUrlInputRef.current) srcUrlInputRef.current.value = "";
           kind = "m3u";
         } else {
-          const base = (xtBaseInputRef.current?.value ?? xtBase).trim();
-          const xtreamUser = (xtUserInputRef.current?.value ?? xtUser).trim();
-          const password = (xtPassInputRef.current?.value ?? xtPass).trim();
+          const base = (xtBaseInputRef.current?.value ?? "").trim();
+          const xtreamUser = (xtUserInputRef.current?.value ?? "").trim();
+          const password = (xtPassInputRef.current?.value ?? "").trim();
           if (!base) throw new Error("Enter the Xtream server URL (e.g. http://panel.example:8080)");
           if (!xtreamUser) throw new Error("Enter the Xtream username");
           if (!password) throw new Error("Enter the Xtream password");
@@ -478,9 +495,9 @@ export function App() {
             xtreamPassword: password,
           });
           data = r.data;
-          setXtBase("");
-          setXtUser("");
-          setXtPass("");
+          if (xtBaseInputRef.current) xtBaseInputRef.current.value = "";
+          if (xtUserInputRef.current) xtUserInputRef.current.value = "";
+          if (xtPassInputRef.current) xtPassInputRef.current.value = "";
           kind = "xtream";
         }
         setSources((prev) => {
@@ -495,6 +512,7 @@ export function App() {
       } catch (e) {
         notify(clientErrorMessage(e));
       } finally {
+        sourceAddInFlightRef.current = false;
         setSourceSubmitting(false);
       }
     })();
@@ -571,10 +589,30 @@ export function App() {
         setPlaylistAutosaveState("saving");
         try {
           const u = callable<
-            { id: string; rules: Record<string, unknown>; enrichEnabled: boolean; duplicateNewIntoLatest: boolean },
+            {
+              id: string;
+              rules: Record<string, unknown>;
+              enrichEnabled: boolean;
+              duplicateNewIntoLatest: boolean;
+              maxChannelsToLoad?: number | null;
+            },
             { ok: boolean }
           >("updatePlaylist");
-          await u({ id, rules, enrichEnabled: enrich, duplicateNewIntoLatest: dupLatest });
+          const trimmedCap = maxChannelsDraft.trim();
+          let maxChannelsToLoad: number | null | undefined;
+          if (trimmedCap === "") maxChannelsToLoad = null;
+          else {
+            const n = Math.floor(Number(trimmedCap));
+            if (!Number.isFinite(n) || n < 1) maxChannelsToLoad = undefined;
+            else maxChannelsToLoad = Math.min(LIMITS.MAX_CHANNELS_PER_PLAYLIST, n);
+          }
+          await u({
+            id,
+            rules,
+            enrichEnabled: enrich,
+            duplicateNewIntoLatest: dupLatest,
+            ...(maxChannelsToLoad !== undefined ? { maxChannelsToLoad } : {}),
+          });
           if (token !== playlistAutosaveToken.current) return;
           setPlaylistAutosaveState("saved");
           window.setTimeout(() => {
@@ -589,7 +627,7 @@ export function App() {
       })();
     }, 450);
     return () => window.clearTimeout(t);
-  }, [rulesJson, enrich, dupLatest, selectedPl, selected?.id, notify]);
+  }, [rulesJson, enrich, dupLatest, maxChannelsDraft, selectedPl, selected?.id, notify]);
 
   const fetchDiff = (id: string) => {
     void (async () => {
@@ -822,6 +860,35 @@ export function App() {
                       Your IPTV app only downloads the hosted M3U. These actions talk to the server; large playlists can take
                       several minutes.
                     </p>
+                    <div className="mt-3 flex flex-col gap-2 rounded-lg border border-zinc-800/80 bg-zinc-950/40 p-3 sm:flex-row sm:flex-wrap sm:items-end">
+                      <label className="block min-w-[12rem] flex-1 text-xs text-zinc-400">
+                        <span className="font-medium text-zinc-300">Max channels to load from sources (refresh)</span>
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          pattern="[0-9]*"
+                          value={maxChannelsDraft}
+                          onChange={(e) => setMaxChannelsDraft(e.target.value.replace(/\D/g, ""))}
+                          placeholder={`Default ${LIMITS.MAX_CHANNELS_PER_PLAYLIST.toLocaleString()}`}
+                          disabled={playlistRefreshing}
+                          className="mt-1 w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 font-mono text-sm text-zinc-100 outline-none ring-emerald-500/40 focus:ring-2 disabled:opacity-50"
+                        />
+                        <span className="mt-1 block text-[11px] leading-snug text-zinc-500">
+                          Leave blank for the full cap ({LIMITS.MAX_CHANNELS_PER_PLAYLIST.toLocaleString()}). Merges sources in
+                          order until this many rows, then skips the rest (saved with your rules after a short pause).
+                        </span>
+                      </label>
+                      <p className="text-[11px] text-zinc-500 sm:max-w-[14rem] sm:pb-1">
+                        Effective cap for this playlist:{" "}
+                        <span className="font-mono text-zinc-300">
+                          {(
+                            maxChannelsDraft.trim() !== ""
+                              ? effectiveMaxChannelsForPlaylist(Math.floor(Number(maxChannelsDraft)))
+                              : effectiveMaxChannelsForPlaylist(selected.maxChannelsToLoad)
+                          ).toLocaleString()}
+                        </span>
+                      </p>
+                    </div>
                     <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
                       <div className="flex min-h-11 flex-wrap items-center gap-1">
                         <button
@@ -1027,31 +1094,30 @@ export function App() {
               />
               {srcKind === "m3u" ? (
                 <input
+                  key="src-m3u-url"
                   ref={srcUrlInputRef}
                   placeholder="https://…/playlist.m3u"
                   className="min-h-11 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm sm:min-h-0 sm:py-2"
-                  value={srcUrl}
-                  onChange={(e) => setSrcUrl(e.target.value)}
-                  onInput={(e) => setSrcUrl(e.currentTarget.value)}
+                  name="iptvM3uUrl"
+                  defaultValue=""
+                  autoComplete="off"
                 />
               ) : (
-                <>
+                <div key="src-xtream-fields" className="space-y-3">
                   <input
                     ref={xtBaseInputRef}
                     placeholder="Server URL (e.g. http://panel.example.com or http://host:8080)"
                     className="min-h-11 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm sm:min-h-0 sm:py-2"
-                    value={xtBase}
-                    onChange={(e) => setXtBase(e.target.value)}
-                    onInput={(e) => setXtBase(e.currentTarget.value)}
+                    name="iptvXtreamHost"
+                    defaultValue=""
                     autoComplete="off"
                   />
                   <input
                     ref={xtUserInputRef}
                     placeholder="Username"
                     className="min-h-11 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm sm:min-h-0 sm:py-2"
-                    value={xtUser}
-                    onChange={(e) => setXtUser(e.target.value)}
-                    onInput={(e) => setXtUser(e.currentTarget.value)}
+                    name="iptvXtreamUsername"
+                    defaultValue=""
                     autoComplete="username"
                   />
                   <input
@@ -1059,16 +1125,15 @@ export function App() {
                     placeholder="Password"
                     type="password"
                     className="min-h-11 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm sm:min-h-0 sm:py-2"
-                    value={xtPass}
-                    onChange={(e) => setXtPass(e.target.value)}
-                    onInput={(e) => setXtPass(e.currentTarget.value)}
+                    name="iptvXtreamPassword"
+                    defaultValue=""
                     autoComplete="current-password"
                   />
                   <p className="text-xs text-zinc-500">
                     Use the same host you would put in an IPTV app for Xtream API (not the long M3U link). Live + VOD
                     are included; series are not.
                   </p>
-                </>
+                </div>
               )}
               <button
                 type="button"

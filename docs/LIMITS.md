@@ -7,14 +7,14 @@ These limits match the **IPTV Middleware MVP** product requirement: *hard caps s
 | `FETCH_M3U_TIMEOUT_MS` | 240,000 ms (4 min) | Per-source upstream HTTP GET (`refresh.ts`) |
 | `MAX_SOURCES_PER_USER` | 12 | Firestore + refresh fan-out |
 | `MAX_PLAYLISTS_PER_USER` | 15 | Per-user playlist count |
-| `MAX_CHANNELS_PER_PLAYLIST` | 500,000 | Parse memory / job time cap for one merged playlist |
-| `MAX_M3U_BYTES` | 45 MiB | Single upstream or output body |
+| `MAX_CHANNELS_PER_PLAYLIST` | 500,000 | Parse memory / job time cap for one merged playlist (also the default when `maxChannelsToLoad` is unset on the playlist doc) |
+| `MAX_M3U_BYTES` | 70 MiB | Single upstream or output body |
 | `MAX_SOURCE_URL_LENGTH` | 4,096 | Source URL field |
 | `MAX_XTREAM_BASE_URL_LENGTH` | 512 | Xtream panel base URL (http(s) + host + optional port) |
 | `MAX_XTREAM_USERNAME_LENGTH` | 256 | Xtream username |
 | `MAX_XTREAM_PASSWORD_LENGTH` | 256 | Xtream password |
 | `XTREAM_HTTP_TIMEOUT_MS` | 120,000 ms | Per `player_api.php` request in `xtream.ts` |
-| `XTREAM_MAX_API_RESPONSE_BYTES` | 45 MiB | Max JSON body per Xtream API response |
+| `XTREAM_MAX_API_RESPONSE_BYTES` | 70 MiB | Max JSON body per Xtream API response |
 | `XTREAM_MAX_CATEGORY_REQUESTS` | 4,000 | Max per-category stream fetches per phase (live, then VOD); stops earlier at the channel cap |
 | `XTREAM_PAGE_SIZE` | 2,000 | Full-size first page triggers `limit`/`offset` follow-ups |
 | `XTREAM_MAX_STREAM_PAGES_PER_CATEGORY` | 40 | Max paginated stream pages per category |
@@ -39,9 +39,13 @@ These limits match the **IPTV Middleware MVP** product requirement: *hard caps s
 - **Xtream Codes:** `player_api.php` is used to pull categories and streams; the Functions build an **M3U** in memory (same merge/rules path as URL sources). Live TV is fetched first (bulk `get_live_streams` when the panel returns a list, else **every** live category until the channel cap or `XTREAM_MAX_CATEGORY_REQUESTS`). If a single response contains exactly `XTREAM_PAGE_SIZE` streams, additional pages are requested with `offset`/`limit` until a short or duplicate page. **VOD** uses the same category + paging pattern. **Series** are not expanded (different API shape).
 - **Refresh progress:** While `runPlaylistRefresh` runs, the playlist document may include ephemeral `refreshProgress` (`phase`, `channelsSoFar`, `sourcesDone` / `sourcesTotal`, optional `detail`). The web app listens over Firestore for live status; the field is removed on success or failure (throttled by `REFRESH_PROGRESS_MIN_MS`).
 
+## Optional per-playlist cap
+
+- **`maxChannelsToLoad`** (Firestore field on `playlists/{id}`, optional integer `1` … `MAX_CHANNELS_PER_PLAYLIST`): on each refresh, merge stops after this many channel rows across sources in `sourceIds` order (remaining sources are skipped). Omit or delete the field to use the full `MAX_CHANNELS_PER_PLAYLIST` default. Writable only via the `updatePlaylist` callable (not client Firestore writes).
+
 ## Enforcement locations
 
-- `functions/src/constants.ts` — canonical `LIMITS` object.
+- `functions/src/constants.ts` — canonical `LIMITS` object and `effectiveMaxChannelsForPlaylist()`.
 - `functions/src/index.ts` — `countUserSources` / `countUserPlaylists`, URL length, `createPlaylist` source checks.
 - `functions/src/refresh.ts` — `assertLimits`, M3U byte cap after merge, upstream `fetchM3u` timeout / retries.
 - `functions/src/xtream.ts` — Xtream HTTP caps, category fan-out, generated M3U size, optional `onProgress` for refresh UI.

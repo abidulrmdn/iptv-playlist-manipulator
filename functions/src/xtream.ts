@@ -11,6 +11,8 @@ export type XtreamCredentialsJson = {
 export type FetchXtreamM3uOpts = {
   /** Called as rows are assembled (throttle in caller). `built` is rows for this Xtream source so far. */
   onProgress?: (info: { built: number; detail: string }) => void;
+  /** Max rows for this Xtream pull (caller passes remaining room in merged playlist). */
+  maxChannels?: number;
 };
 
 type XtreamServerInfo = {
@@ -269,7 +271,7 @@ async function fetchStreamsAllPages(
 
 /**
  * Build an M3U document from Xtream Codes `player_api.php` (live + VOD). Series are omitted (episode structure differs).
- * Stops at `MAX_CHANNELS_PER_PLAYLIST` rows total.
+ * Stops at `maxChannels` (or `MAX_CHANNELS_PER_PLAYLIST` when omitted) rows total.
  */
 export async function fetchXtreamM3uText(
   cfg: XtreamCredentialsJson,
@@ -278,7 +280,11 @@ export async function fetchXtreamM3uText(
   const { username, password } = cfg;
   const { server, liveExt } = await xtreamAuth(cfg);
   const baseRoot = streamBaseUrl(cfg.baseUrl, server);
-  const max = LIMITS.MAX_CHANNELS_PER_PLAYLIST;
+  const rawMax =
+    typeof opts?.maxChannels === "number" && Number.isFinite(opts.maxChannels)
+      ? Math.floor(opts.maxChannels)
+      : LIMITS.MAX_CHANNELS_PER_PLAYLIST;
+  const max = Math.min(LIMITS.MAX_CHANNELS_PER_PLAYLIST, Math.max(0, rawMax));
   const channels: ChannelEntry[] = [];
 
   const report = (detail: string) => {

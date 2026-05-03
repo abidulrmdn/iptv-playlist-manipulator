@@ -4,7 +4,7 @@ import { FieldValue, Timestamp, type Firestore } from "firebase-admin/firestore"
 import type { Bucket } from "@google-cloud/storage";
 import { decryptUtf8, type EncPayload } from "./crypto.js";
 import { fetchXtreamM3uText } from "./xtream.js";
-import { LIMITS, type PlaylistRules } from "./constants.js";
+import { LIMITS, effectiveMaxChannelsForPlaylist, type PlaylistRules } from "./constants.js";
 import { mergePlaylistRules, partitionRulesKeptDropped } from "./rules.js";
 import { canonicalId, parseM3u, serializeM3u, type ChannelEntry } from "./m3u.js";
 import { enrichWithTmdb } from "./enrich.js";
@@ -31,6 +31,8 @@ export type PlaylistDoc = {
   updatedAt: Timestamp;
   enrichEnabled?: boolean;
   duplicateNewIntoLatest?: boolean;
+  /** Optional cap on merged rows from sources per refresh; omit for full `MAX_CHANNELS_PER_PLAYLIST`. */
+  maxChannelsToLoad?: number;
   nextScheduledRefreshAt?: Timestamp;
   /** Ephemeral UI progress during `runPlaylistRefresh`; deleted on success or failure. */
   refreshProgress?: {
@@ -474,6 +476,7 @@ export async function runPlaylistRefresh(params: {
   const rules = mergePlaylistRules(playlist.rules);
   const merged: ChannelEntry[] = [];
   const sourcesTotal = Math.max(1, playlist.sourceIds.length);
+  const channelCap = effectiveMaxChannelsForPlaylist(playlist.maxChannelsToLoad);
 
   let lastProgAt = 0;
   const writeRefreshProgress = async (
@@ -516,12 +519,15 @@ export async function runPlaylistRefresh(params: {
   );
 
   for (let si = 0; si < playlist.sourceIds.length; si++) {
+    if (merged.length >= channelCap) break;
     const sid = playlist.sourceIds[si]!;
     const sSnap = await db.collection("sources").doc(sid).get();
     if (!sSnap.exists) continue;
     const s = sSnap.data() as SourceDoc;
     if (s.ownerUid !== ownerUid) continue;
     if (s.kind !== "xtream" && !s.urlEnc) continue;
+
+    const remainingForSource = channelCap - merged.length;
 
     await writeRefreshProgress(
       {
@@ -542,6 +548,7 @@ export async function runPlaylistRefresh(params: {
       const plain = decryptUtf8(s.xtreamEnc);
       const cfg = JSON.parse(plain) as { baseUrl: string; username: string; password: string };
       text = await fetchXtreamM3uText(cfg, {
+        maxChannels: remainingForSource,
         onProgress: ({ built, detail }) => {
           void writeRefreshProgress(
             {
@@ -559,7 +566,8 @@ export async function runPlaylistRefresh(params: {
       const url = decryptUtf8(s.urlEnc!);
       text = await fetchM3u(url);
     }
-    merged.push(...parseM3u(text));
+    const parsed = parseM3u(text);
+    merged.push(...parsed.slice(0, Math.max(0, channelCap - merged.length)));
 
     await writeRefreshProgress(
       {
